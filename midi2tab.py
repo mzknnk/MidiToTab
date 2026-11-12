@@ -99,6 +99,7 @@ class Song:
     mod: dict[int, list[tuple[int, int]]] = field(default_factory=dict)      # ch → (tick, CC1)
     dead: list[int] = field(default_factory=list)                 # 空ピッキングのtick
     markers: list[tuple[int, str]] = field(default_factory=list)  # (tick, セクション名)
+    tempos: list[tuple[int, int]] = field(default_factory=list)   # (tick, 1拍のマイクロ秒)
 
 
 @dataclass
@@ -150,6 +151,7 @@ def load_song(mid: mido.MidiFile, tracks: list[int] | None = None,
     rpn: dict[int, list[int]] = {}
     dead: list[int] = []
     markers: list[tuple[int, str]] = []
+    tempos: list[tuple[int, int]] = []
     for i, track in enumerate(mid.tracks):
         tick = 0
         sounding: dict[tuple[int, int], list[Note]] = {}
@@ -157,8 +159,10 @@ def load_song(mid: mido.MidiFile, tracks: list[int] | None = None,
             tick += msg.time
             if msg.type == "time_signature":
                 time_sigs.append((tick, msg.numerator, msg.denominator))
-            elif msg.type == "set_tempo" and bpm is None:
-                bpm = mido.tempo2bpm(msg.tempo)
+            elif msg.type == "set_tempo":
+                tempos.append((tick, msg.tempo))
+                if bpm is None:
+                    bpm = mido.tempo2bpm(msg.tempo)
             elif msg.type == "pitchwheel":
                 semis = msg.pitch / 8192 * bend_range.get(msg.channel, 2.0)
                 wheel.setdefault(msg.channel, []).append((tick, semis))
@@ -204,7 +208,8 @@ def load_song(mid: mido.MidiFile, tracks: list[int] | None = None,
         j = bisect.bisect_right(dead, n.on)
         if j < len(dead) and dead[j] < n.off:
             n.off = dead[j]
-    return Song(mid.ticks_per_beat, notes, time_sigs, bpm, wheel, mod, dead, sorted(markers))
+    return Song(mid.ticks_per_beat, notes, time_sigs, bpm, wheel, mod, dead, sorted(markers),
+                sorted(tempos))
 
 
 # ---------------------------------------------------------------- クオンタイズ
@@ -990,6 +995,7 @@ class Score:
     marks: dict[int, list[str]] = field(default_factory=dict)  # ステップ → マーク
     sections: dict[int, str] = field(default_factory=dict)     # 小節index → セクション名
     difficulty: dict[int, float] = field(default_factory=dict) # 小節index → 弾きにくさの点数
+    tempos: list[tuple[int, int]] = field(default_factory=list)  # 再生用: (tick, 1拍のマイクロ秒)
 
     def tick(self, step: int) -> int:
         """ステップ番号 → tick。編集内容のキーに使う(グリッドを変えても同じ位置を指す)。"""
@@ -1091,7 +1097,8 @@ def analyze(mid: mido.MidiFile, *, tuning: str = "standard", capo: int = 0,
                  asg.tapped, techs, ringing, names, first, rhythm, warnings, tpb, max_fret, marks,
                  find_sections(song, measures, step_ticks),
                  measure_difficulty(events, asg.fingerings, asg.tapped, dead_steps, measures,
-                                    grid, tpb, song.bpm))
+                                    grid, tpb, song.bpm),
+                 song.tempos)
 
 
 # ---------------------------------------------------------------- 手動編集

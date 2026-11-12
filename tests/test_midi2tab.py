@@ -539,3 +539,37 @@ def test_auto_tapping_only_where_it_is_easier():
     # タッピングで易しくならない曲では何も変えない
     calm = raw_midi(bar2)
     assert m.analyze(calm, tapping="auto").tapped == set()
+
+
+def test_playback_times_follow_tempo_and_note_lengths():
+    import playback
+    mid = raw_midi([(1920, 480, 64), (2400, 240, 67), (2880, 960, 60), (2880, 960, 64), (3360, 60, 94)])
+    mid.tracks[0].insert(0, mido.MetaMessage("set_tempo", tempo=500000, time=0))     # 120 BPM
+    # 2小節目の3拍目(tick 2880)から 60 BPM にする
+    tick, i = 0, 0
+    for i, msg in enumerate(mid.tracks[0]):
+        tick += msg.time
+        if tick >= 2880:
+            break
+    mid.tracks[0].insert(i, mido.MetaMessage("set_tempo", tempo=1000000, time=mid.tracks[0][i].time))
+    mid.tracks[0][i + 1].time = 0
+    score = m.analyze(mid, grid=8)
+    data = playback.playback_notes(score)
+    notes = [(n["t"], n["d"], n["p"]) for n in data["notes"]]
+    # 最初の小節(=2小節目)の頭が 0 秒。120BPM なので1拍 0.5 秒、テンポ変更後は1拍 1 秒
+    assert notes[0] == (0.0, 0.5, 64)
+    assert notes[1] == (0.5, 0.25, 67)
+    assert notes[2][:2] == (1.0, 1.0) and notes[3][:2] == (1.0, 1.0)   # 空ピッキングで1拍に切れる
+    dead = [n for n in data["notes"] if "x" in n.get("m", [])]
+    assert dead and all(n["t"] == 2.0 and n["d"] == 0.06 for n in dead)
+    assert data["length"] == 3.0                                        # 2拍 + 遅い2拍
+    assert data["notes"][0]["k"] == 1920                               # 譜面上の位置(tick)
+
+
+def test_playback_carries_marks_and_slide_source():
+    import playback
+    base = edited({})
+    t1 = str(base.tick(1))
+    score = edited({"techs": {t1: "sl"}, "marks": {t1: ["vib", "b2"]}})
+    note = next(n for n in playback.playback_notes(score)["notes"] if n["k"] == base.tick(1))
+    assert note["c"] == "sl" and note["q"] == 64 and note["m"] == ["vib", "b2"]

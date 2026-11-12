@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import marks as marklib
 import midi2tab
 import pdfout
+import playback
 import tabsvg
 
 MAX_BODY = 2_000_000
@@ -43,6 +44,7 @@ class Session:
         return {"title": self.title(edits), "meta": tabsvg.meta_line(score),
                 "svgs": tabsvg.render_systems(score), "warnings": score.warnings,
                 "strings": [midi2tab.pitch_class_name(p) for p in score.opens],
+                "playback": playback.playback_notes(score),
                 "options": options, "edits": edits}
 
     def update(self, edits: dict) -> dict:
@@ -216,6 +218,10 @@ PAGE = """<!doctype html>
                           width: 110px; }
   #pop .danger { color: #a33; }
   .hint { color: #777; font-size: 12px; margin: 14px 0 30px; }
+  #score { position: relative; }
+  #score text.playing { fill: #d0452f; }
+  #cursor { position: absolute; width: 2px; background: rgba(208, 69, 47, .55); pointer-events: none; }
+  #clock { font-variant-numeric: tabular-nums; color: #555; min-width: 78px; }
 </style>
 </head>
 <body>
@@ -238,6 +244,13 @@ PAGE = """<!doctype html>
   <label><input id="chords" type="checkbox"> コード名を推定</label>
   <label><input id="expression" type="checkbox"> チョーキング/ビブラートを推定</label>
   <span class="spacer"></span>
+  <button id="play" class="primary">▶ 再生</button>
+  <label>速さ
+    <select id="speed">
+      <option value="0.5">50%</option><option value="0.75">75%</option>
+      <option value="1" selected>100%</option><option value="1.25">125%</option>
+    </select></label>
+  <span id="clock">0:00 / 0:00</span>
   <button id="undo">元に戻す</button>
   <button id="reset">手直しをリセット</button>
   <button id="pdf" class="primary">PDFで保存</button>
@@ -246,7 +259,7 @@ PAGE = """<!doctype html>
 <p class="meta" id="meta"></p>
 <p id="msg" class="no-print"></p>
 <div id="score"></div>
-<p class="hint no-print">数字をクリック: 弦の変更・奏法記号(スライド、チョーキング、ビブラートなど)・コード名・音の削除。コード名をクリック: 名前の変更。変更は自動で保存されます。</p>
+<p class="hint no-print">再生: 「▶ 再生」またはスペースキー。数字をクリックして「ここから再生」で途中から。数字をクリック: 弦の変更・奏法記号(スライド、チョーキング、ビブラートなど)・コード名・音の削除。コード名をクリック: 名前の変更。変更は自動で保存されます。</p>
 <div id="pop" class="no-print" hidden></div>
 <script>
 const TUNINGS = __TUNINGS__;
@@ -254,9 +267,13 @@ const CONNECTIONS = __CONNECTIONS__, MARKS = __MARKS__, BENDS = __BENDS__, EXCLU
 const isBend = c => /^(pbr|pb|br|b)[0-9.]+$/.test(c);
 const $ = id => document.getElementById(id);
 let edits = {}, history = [], strings = [];
+let song = {notes: [], length: 0};   // 再生用のデータ
 
 function show(state) {
+  stopPlayback();
   edits = state.edits; strings = state.strings;
+  song = state.playback;
+  showClock(0);
   $('title').value = state.title;
   document.title = state.title + ' - midi2tab';
   $('meta').textContent = state.meta;
@@ -420,7 +437,11 @@ function noteEditor(t) {
     pop.append(markRow);
     chordEditor(pop, d.tick, d.chord);
     pop.append(el('h3', {textContent: 'その他'}),
-      el('div', {className: 'row'}, el('button', {textContent: 'この音を譜面から消す', className: 'danger',
+      el('div', {className: 'row'}, el('button', {textContent: '▶ ここから再生', onclick: () => {
+        const first = song.notes.find(n => String(n.k) === d.tick);
+        hidePop();
+        if (first) startPlayback(first.t);
+      }}), el('button', {textContent: 'この音を譜面から消す', className: 'danger',
         onclick: () => commit(e => { e.notes = e.notes || {}; e.notes[key] = {hide: true}; })})));
   });
 }
@@ -436,10 +457,208 @@ $('score').addEventListener('click', ev => {
 document.addEventListener('click', ev => { if (!$('pop').contains(ev.target)) hidePop(); });
 document.addEventListener('keydown', ev => {
   if (ev.key === 'Escape') hidePop();
+  if (ev.key === ' ' && !['INPUT', 'SELECT', 'BUTTON', 'TEXTAREA'].includes(ev.target.tagName)) {
+    ev.preventDefault(); $('play').click();
+  }
   if ((ev.ctrlKey || ev.metaKey) && ev.key === 'z' && ev.target.tagName !== 'INPUT') {
     ev.preventDefault(); $('undo').click();
   }
 });
+
+// ---- 再生: 弦をはじく音をブラウザ内で合成して鳴らす
+let audio = null, master = null, player = null;
+const plucks = new Map();   // 音高と種類ごとの合成済みの音
+
+// Karplus-Strong 法: ノイズを短い遅延線で回し、少しずつ丸めていくと弦の音になる
+function pluckBuffer(pitch, kind) {
+  const key = pitch + kind;
+  if (plucks.has(key)) return plucks.get(key);
+  const sr = audio.sampleRate, freq = 440 * Math.pow(2, (pitch - 69) / 12);
+  const seconds = kind === 'dead' ? 0.12 : kind === 'mute' ? 0.5 : 4.5;
+  const t60 = kind === 'dead' ? 0.035 : kind === 'mute' ? 0.22 : Math.max(1.6, 5.5 - (pitch - 40) * 0.07);
+  const smooth = kind === 'normal' ? 0.5 : 0.62;            // 大きいほど高い倍音が早く消える
+  const period = sr / freq - smooth;                        // 平均化で生じる遅れの分を引く
+  const N = Math.floor(period), frac = period - N;
+  const decay = Math.pow(10, -3 / (t60 * freq));
+  const n = Math.floor(sr * seconds), out = new Float32Array(n);
+  let prevNoise = 0;
+  for (let i = 0; i < N + 2 && i < n; i++) {                // はじいた瞬間のノイズ(少し丸める)
+    const r = Math.random() * 2 - 1;
+    out[i] = 0.55 * r + 0.45 * prevNoise;
+    prevNoise = r;
+  }
+  for (let i = N + 2; i < n; i++) {
+    const a = out[i - N] * (1 - frac) + out[i - N - 1] * frac;
+    const b = out[i - N - 1] * (1 - frac) + out[i - N - 2] * frac;
+    out[i] = decay * ((1 - smooth) * a + smooth * b);
+  }
+  let peak = 0;
+  for (let i = 0; i < n; i++) peak = Math.max(peak, Math.abs(out[i]));
+  const fade = Math.min(n, Math.floor(sr * 0.002));
+  for (let i = 0; i < n; i++) out[i] *= 0.5 / (peak || 1) * (i < fade ? i / fade : 1);
+  const buffer = audio.createBuffer(1, n, sr);
+  buffer.copyToChannel(out, 0);
+  plucks.set(key, buffer);
+  return buffer;
+}
+
+const isBendCode = c => /^(pbr|pb|br|b)[0-9.]+$/.test(c);
+const ratio = semis => Math.pow(2, semis / 12);
+
+// 1音を鳴らす。when は鳴らし始める時刻、dur は長さ(どちらもオーディオ側の秒)
+function playNote(note, when, dur) {
+  const marks = note.m || [];
+  const kind = marks.includes('x') ? 'dead' : marks.includes('pm') ? 'mute' : 'normal';
+  const src = audio.createBufferSource();
+  src.buffer = pluckBuffer(note.p, kind);
+  const gain = audio.createGain();
+  let level = kind === 'dead' ? 0.55 : 0.8;
+  if (['H', 'P', 'T', 'sl'].includes(note.c)) level *= 0.7;   // 弾き直さない音は弱め
+  if (marks.includes('ghost')) level *= 0.45;
+  if (marks.includes('acc')) level *= 1.25;
+  const end = when + dur;
+  gain.gain.setValueAtTime(level, when);
+  gain.gain.setValueAtTime(level, end);
+  gain.gain.exponentialRampToValueAtTime(0.001, end + 0.09);
+  const rate = src.playbackRate;
+  rate.setValueAtTime(1, when);
+  if (note.q != null && note.q !== note.p) {                  // 前の音からスライド
+    rate.setValueAtTime(ratio(note.q - note.p), when);
+    rate.linearRampToValueAtTime(1, when + Math.min(0.08, dur / 2));
+  } else if (marks.includes('si_up') || marks.includes('si_down')) {
+    rate.setValueAtTime(ratio(marks.includes('si_up') ? -2 : 2), when);
+    rate.linearRampToValueAtTime(1, when + Math.min(0.07, dur / 2));
+  }
+  const bend = marks.find(isBendCode);
+  if (bend) {                                                 // チョーキング
+    const m = bend.match(/^(pbr|pb|br|b)([0-9.]+)$/), up = ratio(parseFloat(m[2]));
+    if (m[1] === 'b') { rate.linearRampToValueAtTime(up, when + Math.min(0.3, dur * 0.5)); }
+    if (m[1] === 'br') {
+      rate.linearRampToValueAtTime(up, when + dur * 0.35);
+      rate.setValueAtTime(up, when + dur * 0.55);
+      rate.linearRampToValueAtTime(1, when + dur * 0.85);
+    }
+    if (m[1] === 'pb') rate.setValueAtTime(up, when);
+    if (m[1] === 'pbr') { rate.setValueAtTime(up, when); rate.linearRampToValueAtTime(1, when + dur * 0.6); }
+  }
+  if (marks.includes('so_down') || marks.includes('so_up')) { // 音の終わりで滑らせる
+    const slide = Math.min(0.14, dur / 2);
+    rate.setValueAtTime(1, end - slide);
+    rate.linearRampToValueAtTime(ratio(marks.includes('so_down') ? -5 : 5), end + 0.06);
+  }
+  if ((marks.includes('vib') || marks.includes('tr')) && dur > 0.2) {   // ビブラート
+    const lfo = audio.createOscillator(), depth = audio.createGain();
+    lfo.frequency.value = 5.5;
+    depth.gain.value = marks.includes('tr') ? 100 : 28;       // セント
+    lfo.connect(depth).connect(src.detune);
+    lfo.start(when + 0.1); lfo.stop(end + 0.1);
+  }
+  src.connect(gain).connect(master);
+  src.start(when); src.stop(end + 0.12);
+  return src;
+}
+
+function showClock(t) {
+  const f = s => Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0');
+  $('clock').textContent = f(Math.max(0, t)) + ' / ' + f(song.length || 0);
+}
+
+function startPlayback(from = 0) {
+  stopPlayback();
+  if (!song.notes.length) return;
+  if (!audio) {
+    audio = new (window.AudioContext || window.webkitAudioContext)();
+    const tone = audio.createBiquadFilter();                  // 胴鳴りの代わりに高域を少し落とす
+    tone.type = 'lowpass'; tone.frequency.value = 5200;
+    const limiter = audio.createDynamicsCompressor();
+    master = audio.createGain(); master.gain.value = 0.55;
+    master.connect(tone).connect(limiter).connect(audio.destination);
+  }
+  audio.resume();
+  const byTick = new Map();                                   // 譜面上の位置 → その数字の要素
+  document.querySelectorAll('#score text.n').forEach(t => {
+    if (!byTick.has(t.dataset.tick)) byTick.set(t.dataset.tick, []);
+    byTick.get(t.dataset.tick).push(t);
+  });
+  const cursor = el('div', {id: 'cursor'});
+  $('score').append(cursor);
+  player = {
+    speed: parseFloat($('speed').value), pos0: from, time0: audio.currentTime + 0.12,
+    next: song.notes.findIndex(n => n.t >= from - 1e-6), live: [], scheduled: 0,
+    byTick, cursor, shown: null, seen: -1,
+  };
+  if (player.next < 0) player.next = song.notes.length;
+  $('play').textContent = '■ 停止';
+  player.timer = setInterval(schedule, 40);
+  schedule();
+  player.frame = requestAnimationFrame(follow);
+}
+
+function songTime() { return player.pos0 + (audio.currentTime - player.time0) * player.speed; }
+
+// 少し先までの音を予約する(まとめて予約すると停止や速さの変更が効かないため)
+function schedule() {
+  if (!player) return;
+  const horizon = songTime() + 0.35 * player.speed;
+  while (player.next < song.notes.length && song.notes[player.next].t <= horizon) {
+    const note = song.notes[player.next++];
+    const strum = note.s * 0.006;                             // 和音は低音弦から少しずらす
+    const when = Math.max(audio.currentTime, player.time0 + (note.t - player.pos0) / player.speed) + strum;
+    player.live.push(playNote(note, when, note.d / player.speed));
+    player.scheduled++;
+  }
+  if (player.live.length > 400) player.live.splice(0, 200);
+  if (songTime() > song.length + 0.5) stopPlayback();
+}
+
+// 再生位置にあわせて、いま鳴っている数字を強調し、カーソルを動かす
+function follow() {
+  if (!player) return;
+  const now = songTime();
+  showClock(now);
+  let i = player.seen;
+  while (i + 1 < song.notes.length && song.notes[i + 1].t <= now) i++;
+  if (i !== player.seen && i >= 0) {
+    player.seen = i;
+    const tick = String(song.notes[i].k);
+    if (tick !== player.shown) {
+      (player.byTick.get(player.shown) || []).forEach(t => t.classList.remove('playing'));
+      player.shown = tick;
+      const targets = player.byTick.get(tick) || [];
+      targets.forEach(t => t.classList.add('playing'));
+      if (targets.length) {
+        const box = $('score').getBoundingClientRect();
+        const staff = targets[0].closest('svg').getBoundingClientRect();
+        const r = targets[0].getBoundingClientRect();
+        Object.assign(player.cursor.style, {
+          left: (r.left + r.width / 2 - box.left - 1) + 'px',
+          top: (staff.top - box.top + staff.height * 0.36) + 'px', height: (staff.height * 0.5) + 'px'});
+        if (staff.top < 70 || staff.bottom > window.innerHeight - 10)
+          window.scrollTo({top: window.scrollY + staff.top - 120, behavior: 'smooth'});
+      }
+    }
+  }
+  player.frame = requestAnimationFrame(follow);
+}
+
+function stopPlayback() {
+  if (!player) return;
+  clearInterval(player.timer);
+  cancelAnimationFrame(player.frame);
+  player.live.forEach(src => { try { src.stop(); } catch (err) {} });
+  document.querySelectorAll('#score text.playing').forEach(t => t.classList.remove('playing'));
+  player.cursor.remove();
+  window.lastPlayback = {scheduled: player.scheduled, position: songTime()};  // 動作確認用
+  player = null;
+  $('play').textContent = '▶ 再生';
+}
+
+$('play').onclick = () => player ? stopPlayback() : startPlayback(0);
+$('speed').onchange = () => {                                 // 再生中に速さを変えたら、その位置から続ける
+  if (!player) return;
+  const now = songTime();
+  player.pos0 = now; player.time0 = audio.currentTime; player.speed = parseFloat($('speed').value);
+};
 load();
 </script>
 </body>

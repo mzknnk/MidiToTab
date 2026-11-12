@@ -8,7 +8,8 @@
 - `chords.py` — コードネーム判定
 - `marks.py` — 奏法記号の定義と、ピッチベンドからの自動判定
 - `tabsvg.py` — 譜面のSVG/HTML描画
-- `editor.py` — 編集画面(ローカルHTTPサーバー + 1ページのUI)
+- `editor.py` — 編集画面(ローカルHTTPサーバー + 1ページのUI。再生の音の合成もここのJS)
+- `playback.py` — 再生用データ(各音の開始秒・長さ)の計算
 - `pdfout.py` — ヘッドレスChromeによるPDF化
 - `tests/test_midi2tab.py` — テスト
 
