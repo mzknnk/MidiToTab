@@ -379,3 +379,27 @@ def test_all_marks_render(tmp_path):
     joined = "".join(svgs)
     for text in ("P.M.", "N.H.", "A.H.", "P.H.", ">X<", "full", "sl.", "&lt;"):
         assert text in joined, text
+
+
+def test_editor_falls_back_when_default_port_is_taken():
+    import socket
+    import editor
+    session = editor.Session(make_midi(LICK), {}, {}, None, "song")
+    blocker = socket.socket()
+    try:
+        try:
+            blocker.bind(("127.0.0.1", editor.DEFAULT_PORT))
+            blocker.listen()
+        except OSError:
+            pass  # すでに誰かが使っている。どちらにせよ既定のポートは開けない
+        server = editor.open_server(session, None)
+        try:
+            assert server.server_address[1] not in (0, editor.DEFAULT_PORT)
+        finally:
+            server.server_close()
+        # 番号を明示したときは勝手に変えない
+        import pytest
+        with pytest.raises(OSError):
+            editor.open_server(session, editor.DEFAULT_PORT)
+    finally:
+        blocker.close()

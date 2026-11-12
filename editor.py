@@ -18,6 +18,7 @@ import pdfout
 import tabsvg
 
 MAX_BODY = 2_000_000
+DEFAULT_PORT = 8765
 
 
 class Session:
@@ -133,8 +134,21 @@ def make_server(session: Session, port: int) -> ThreadingHTTPServer:
     return ThreadingHTTPServer(("127.0.0.1", port), make_handler(session))
 
 
+def open_server(session: Session, port: int | None) -> ThreadingHTTPServer:
+    """port 未指定なら 8765 を試し、使えなければ空いている番号を自動で選ぶ。
+
+    Windows では Hyper-V などが 8765 付近を予約していて開けないことがある。
+    """
+    if port is not None:
+        return make_server(session, port)
+    try:
+        return make_server(session, DEFAULT_PORT)
+    except OSError:
+        return make_server(session, 0)
+
+
 def serve(mid, fixed: dict, edits: dict, edits_path: str, default_title: str,
-          port: int = 8765, open_browser: bool = True) -> int:
+          port: int | None = None, open_browser: bool = True) -> int:
     session = Session(mid, fixed, edits, edits_path, default_title)
     try:
         session.render()
@@ -142,7 +156,7 @@ def serve(mid, fixed: dict, edits: dict, edits_path: str, default_title: str,
         print(f"エラー: {e}")
         return 1
     try:
-        server = make_server(session, port)
+        server = open_server(session, port)
     except OSError as e:
         print(f"ポート {port} を開けません ({e})。--port で別の番号を指定してください")
         return 1

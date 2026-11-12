@@ -833,7 +833,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--format", choices=["ascii", "html", "pdf"], help="出力形式(既定は -o の拡張子で判断)")
     ap.add_argument("--edit", action="store_true", help="ブラウザで編集画面を開く")
     ap.add_argument("--edits", help="編集内容のJSONファイル(既定は <MIDIファイル名>.edits.json)")
-    ap.add_argument("--port", type=int, default=8765, help="編集画面のポート番号 (既定 8765)")
+    ap.add_argument("--port", type=int,
+                    help="編集画面のポート番号 (既定は 8765、使えなければ空き番号を自動で選ぶ)")
     ap.add_argument("--no-open", action="store_true", help="編集画面を起動してもブラウザを開かない")
     ap.add_argument("--title", help="譜面のタイトル(HTML出力。既定はファイル名)")
     ap.add_argument("--list", action="store_true", help="トラック一覧を表示して終了")
