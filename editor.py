@@ -230,7 +230,11 @@ PAGE = """<!doctype html>
       <option value="24">3連16分</option><option value="48">16分+3連</option>
     </select></label>
   <label><input id="legato" type="checkbox"> H/P を推定</label>
-  <label><input id="tapping" type="checkbox"> タッピングを推定</label>
+  <label>タッピング
+    <select id="tapping">
+      <option value="">なし</option><option value="auto">易しくなる小節だけ</option>
+      <option value="on">積極的に</option>
+    </select></label>
   <label><input id="chords" type="checkbox"> コード名を推定</label>
   <label><input id="expression" type="checkbox"> チョーキング/ビブラートを推定</label>
   <span class="spacer"></span>
@@ -265,7 +269,7 @@ function show(state) {
   $('capo').value = o.capo;
   $('grid').value = o.grid == null ? '' : String(o.grid);
   $('legato').checked = o.legato || o.tapping;
-  $('tapping').checked = o.tapping;
+  $('tapping').value = o.tapping === 'auto' ? 'auto' : o.tapping ? 'on' : '';
   $('chords').checked = o.chords;
   $('expression').checked = o.expression;
   $('undo').disabled = history.length === 0;
@@ -302,7 +306,7 @@ $('grid').onchange = e => setOption('grid', e.target.value ? parseInt(e.target.v
 $('legato').onchange = e => commit(x => {
   x.options = x.options || {}; x.options.legato = e.target.checked;
   if (!e.target.checked) x.options.tapping = false; });
-$('tapping').onchange = e => setOption('tapping', e.target.checked);
+$('tapping').onchange = e => setOption('tapping', e.target.value === 'auto' ? 'auto' : e.target.value === 'on');
 $('chords').onchange = e => setOption('chords', e.target.checked);
 $('expression').onchange = e => setOption('expression', e.target.checked);
 $('title').onchange = e => commit(x => { x.title = e.target.value.trim(); });

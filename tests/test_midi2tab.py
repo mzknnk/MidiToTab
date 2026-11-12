@@ -506,3 +506,36 @@ def test_melody_over_held_bass_shares_strings():
     assert 1 not in strings                                  # 鳴っているベースの弦は使わない
     frets = [f for step in sorted(score.fingerings) for s, f in score.fingerings[step] if s != 1 and f]
     assert max(frets) - min(frets) <= 4
+
+
+def test_difficulty_levels():
+    easy = m.analyze(raw_midi([(i * 480, 470, p) for i, p in enumerate([40, 45, 50, 55] * 2)]))
+    assert [m.difficulty_level(p) for p in easy.difficulty.values()] == [1, 1]
+    # 16分音符で、ローポジションとハイポジションを行き来する
+    jumps = [(i * 120, 110, p) for i, p in enumerate([41, 84, 43, 86, 41, 84, 43, 86] * 4)]
+    hard = m.analyze(raw_midi(jumps))
+    assert min(m.difficulty_level(p) for p in hard.difficulty.values()) >= 4
+    assert [m.difficulty_level(p) for p in (0, 1.5, 3, 4.5, 6.5, 99)] == [1, 2, 3, 4, 5, 5]
+    import tabsvg
+    assert "難易度: 最大 Lv" in tabsvg.meta_line(hard) and ">Lv" in tabsvg.render_systems(hard)[0]
+
+
+def test_auto_tapping_only_where_it_is_easier():
+    # 1小節目: 低いコードの上に高い音が速く出入りする(左手だけだと大きな移動の繰り返し)
+    # 2小節目: ゆっくりした単音だけ
+    bar1 = [(0, 1900, 40), (0, 1900, 47), (0, 1900, 52)]
+    bar1 += [(240 + i * 240, 110, p) for i, p in enumerate([76, 79, 76, 79, 76, 79])]
+    bar2 = [(1920 + i * 480, 470, p) for i, p in enumerate([52, 55, 57, 59])]
+    mid = raw_midi(bar1 + bar2)
+    plain = m.analyze(mid, grid=16)
+    auto = m.analyze(mid, grid=16, tapping="auto")
+    assert plain.tapped == set()
+    assert auto.tapped and all(s < 16 for s in auto.tapped)        # 1小節目だけ
+    assert any("1" in w and "タッピング" in w for w in auto.warnings)
+    assert m.difficulty_level(auto.difficulty[0]) < m.difficulty_level(plain.difficulty[0])
+    assert auto.fingerings[16] == ((2, 2),)     # 左手が動かないので、次の小節もローポジションのまま
+    # 5・6弦は叩かない
+    assert all(s >= 2 for step in auto.tapped for s, f in auto.fingerings[step] if f >= 10)
+    # タッピングで易しくならない曲では何も変えない
+    calm = raw_midi(bar2)
+    assert m.analyze(calm, tapping="auto").tapped == set()

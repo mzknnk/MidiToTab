@@ -8,7 +8,7 @@ from __future__ import annotations
 from html import escape
 
 import marks as marklib
-from midi2tab import Item, Score, pitch_class_name
+from midi2tab import Item, Score, difficulty_level, pitch_class_name
 
 PAGE_W = 1100
 LEFT = 40          # 弦名ラベルの分
@@ -21,6 +21,7 @@ TS_W = 28          # 拍子記号の幅
 INK = "#1a1a1a"
 GREY = "#8a8a8a"
 LINE = "#a8a8a8"
+LEVEL_COLORS = {1: "#9a9a9a", 2: "#9a9a9a", 3: "#b8860b", 4: "#d2691e", 5: "#c62828"}
 
 
 def item_width(it: Item, score: Score) -> float:
@@ -164,8 +165,14 @@ def draw_system(score: Score, measure_ids: list[int], last: bool) -> str:
     for mi in measure_ids:
         ms, ml, num, den = score.measures[score.first_measure + mi]
         items = score.rhythm[mi]
+        number = str(score.first_measure + mi + 1)
         fg.append(f'<text x="{x + 3:.1f}" y="{top - 7}" font-size="9.5" fill="{GREY}">'
-                  f'{score.first_measure + mi + 1}</text>')
+                  f'{number}</text>')
+        points = score.difficulty.get(score.first_measure + mi)
+        if points is not None:  # 小節の難易度
+            level = difficulty_level(points)
+            fg.append(f'<text x="{x + 8 + 5.6 * len(number):.1f}" y="{top - 7}" font-size="8.5" '
+                      f'font-weight="700" fill="{LEVEL_COLORS[level]}">Lv{level}</text>')
         section = score.sections.get(score.first_measure + mi)
         if section:  # セクション名 (MIDIのマーカー)
             w = 7.4 * len(section) + 12
@@ -435,6 +442,9 @@ def meta_line(score: Score) -> str:
     meta.append("Tuning: " + " ".join(pitch_class_name(p) for p in score.opens))
     if score.capo:
         meta.append(f"Capo {score.capo}")
+    if score.difficulty:
+        levels = [difficulty_level(p) for p in score.difficulty.values()]
+        meta.append(f"難易度: 最大 Lv{max(levels)} / 平均 Lv{sum(levels) / len(levels):.1f}")
     return "  ·  ".join(meta)
 
 
