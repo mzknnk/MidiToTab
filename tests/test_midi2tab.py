@@ -573,3 +573,22 @@ def test_playback_carries_marks_and_slide_source():
     score = edited({"techs": {t1: "sl"}, "marks": {t1: ["vib", "b2"]}})
     note = next(n for n in playback.playback_notes(score)["notes"] if n["k"] == base.tick(1))
     assert note["c"] == "sl" and note["q"] == 64 and note["m"] == ["vib", "b2"]
+
+
+def test_string_edits_in_one_chord_do_not_depend_on_order():
+    # Cコード(5弦3, 4弦2, 3弦0)。E3 を4弦から5弦へ、C3 を5弦から6弦へ動かす。
+    # どちらの指定が先に記録されていても、まとめて適用されて両方通る
+    chord = [(0, 900, 48), (0, 900, 52), (0, 900, 55)]
+    base = m.analyze(raw_midi(chord), grid=4)
+    assert base.fingerings[0] == ((1, 3), (2, 2), (3, 0))
+    move_e = ("0:52", {"string": 1})   # E3: 5弦7フレットへ(5弦は C3 が使用中)
+    move_c = ("0:48", {"string": 0})   # C3: 6弦8フレットへ
+    for order in ([move_e, move_c], [move_c, move_e]):
+        score = m.analyze(raw_midi(chord), grid=4, edits={"notes": dict(order)})
+        assert score.fingerings[0] == ((0, 8), (1, 7), (3, 0))
+    # 動かしていない音とぶつかる指定だけが無視される
+    score = m.analyze(raw_midi(chord), grid=4, edits={"notes": dict([move_e])})
+    assert score.fingerings[0] == base.fingerings[0]
+    # 2つの音を同じ弦に動かす指定は、あとの1つだけ取り消す
+    both = {"0:52": {"string": 0}, "0:48": {"string": 0}}
+    assert len({s for s, _ in m.analyze(raw_midi(chord), grid=4, edits={"notes": both}).fingerings[0]}) == 3

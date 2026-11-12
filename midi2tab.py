@@ -1118,29 +1118,49 @@ EDITABLE_OPTIONS = {"tuning": "standard", "capo": 0, "grid": None,
 
 def apply_note_edits(asg: Assignment, opens: list[int], max_fret: int,
                      edits: dict, step_ticks: float) -> None:
-    """弦の変更・音の非表示を運指に反映する。成立しない指定は無視する。"""
+    """弦の変更・音の非表示を運指に反映する。成立しない指定は無視する。
+
+    同じ和音への指定はまとめて同時に適用する(「AをどかしてからBをそこへ」が、
+    指定を記録した順番に関係なく通るように)。
+    """
+    by_step: dict[int, dict[int, dict]] = {}
     for key, edit in edits.get("notes", {}).items():
         try:
             tick, pitch = (int(x) for x in key.split(":"))
         except ValueError:
             continue
-        step = round(tick / step_ticks)
+        if isinstance(edit, dict):
+            by_step.setdefault(round(tick / step_ticks), {})[pitch] = edit
+    for step, wanted in by_step.items():
         fing = asg.fingerings.get(step)
-        if not fing or not any(opens[s] + f == pitch for s, f in fing):
+        if not fing:
             continue
-        others = [(s, f) for s, f in fing if opens[s] + f != pitch]
-        if edit.get("hide"):
-            new = others
-        else:
+        original = {opens[s] + f: (s, f) for s, f in fing}
+        placed = dict(original)
+        moved = []
+        for pitch, edit in wanted.items():
+            if pitch not in placed:
+                continue
+            if edit.get("hide"):
+                del placed[pitch]
+                continue
             s = edit.get("string")
-            if not isinstance(s, int) or not 0 <= s < len(opens):
-                continue
-            fret = pitch - opens[s]
-            if not 0 <= fret <= max_fret or any(o == s for o, _ in others):
-                continue
-            new = others + [(s, fret)]
-        if new:
-            asg.fingerings[step] = tuple(sorted(new))
+            if isinstance(s, int) and 0 <= s < len(opens) and 0 <= pitch - opens[s] <= max_fret:
+                placed[pitch] = (s, pitch - opens[s])
+                moved.append(pitch)
+        # 同じ弦に2音が重なったら、動かした音を1つずつ元に戻す
+        while True:
+            used = collections.Counter(s for s, _ in placed.values())
+            clash = [p for p in reversed(moved) if used[placed[p][0]] > 1]
+            if not clash:
+                break
+            # 動かしていない音とぶつかっている指定を先に取り消す
+            fixed = {placed[p][0] for p in placed if p not in moved}
+            pitch = next((p for p in clash if placed[p][0] in fixed), clash[0])
+            placed[pitch] = original[pitch]
+            moved.remove(pitch)
+        if placed:
+            asg.fingerings[step] = tuple(sorted(placed.values()))
         else:
             del asg.fingerings[step]
             asg.tapped.discard(step)
