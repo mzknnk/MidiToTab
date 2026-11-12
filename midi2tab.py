@@ -43,7 +43,6 @@ AUTO_GRIDS = [4, 8, 12, 16, 24, 32, 48]
 MAX_CANDIDATES = 40  # 和音ごとに保持する運指候補の上限
 HAND_REACH = 3       # 手を動かさずに届く範囲: ポジション p なら p〜p+3 フレット
 MAX_GROUP_COST = 3.5  # アルペジオを1つのフォームとみなす上限(これより弾きにくければ分ける)
-INVERT_COST = 1.0       # 低音弦側が高音弦側より3フレット以上高い形の、超過1フレットあたりのコスト
 SKIP_COST = 2.0         # 同時に弾く音の間で、余分に飛ばす弦1本あたりのコスト
 RING_CUT = 1.0          # 鳴っている音と同じ弦を使って切ってしまうコスト(切れる長さ1拍あたり)
 SAME_SHAPE_MOVE = 0.25 # 同じフォームのまま1フレット動かすコスト(通常の移動は 1 + 固定1)
@@ -367,6 +366,41 @@ def inversion(fing) -> int:
     return worst
 
 
+# 逆向きのフォームの弾きにくさ。場合分けの基準はここにまとめてある
+INVERT_BASE = {3: 1.0, 4: 2.0, 5: 3.5}   # 逆向きの大きさ(フレット) → 基本の点数。6以上は INVERT_MAX
+INVERT_MAX = 6.0
+INVERT_BY_NOTES = {2: 0.6, 3: 1.0}        # 押さえる音の数 → 倍率。4音以上は 1.3
+INVERT_HIGH_POSITION = 0.6                # 9フレット以上(フレットの間隔が狭い) の倍率
+INVERT_LOW_POSITION = 1.2                 # 3フレット以下(フレットの間隔が広い) の倍率
+INVERT_BARRE = 0.8                        # 高音弦側を人差し指1本(セーハ)でまとめて押さえられるときの倍率
+
+
+def inversion_cost(fing) -> float:
+    """低音弦だけ高いフレットになる「逆向き」の形の弾きにくさ。
+
+    無理ではないが条件で難しさが変わるので、段階をつける:
+      大きさ   2フレットまでは普通(0点)。3 → 4 → 5 と急に難しくなり、6以上はほぼ無理
+      音の数   2音だけなら他の指が自由なので楽。4音以上は余裕がない
+      位置     ハイポジションはフレットが狭いので届きやすい。ローポジションは逆に厳しい
+      セーハ   高音弦側が同じフレットに並んでいれば、人差し指1本で済むので少し楽
+    """
+    amount = inversion(fing)
+    if amount <= 2:
+        return 0.0
+    fretted = sorted((s, f) for s, f in fing if f > 0)
+    cost = INVERT_BASE.get(amount, INVERT_MAX)
+    cost *= INVERT_BY_NOTES.get(len(fretted), 1.3)
+    lo = min(f for _, f in fretted)
+    if lo >= 9:
+        cost *= INVERT_HIGH_POSITION
+    elif lo <= 3:
+        cost *= INVERT_LOW_POSITION
+    low_fret_notes = [s for s, f in fretted if f == lo]
+    if len(low_fret_notes) >= 2 and min(low_fret_notes) > min(s for s, f in fretted if f > lo):
+        cost *= INVERT_BARRE
+    return round(cost, 2)
+
+
 def shape_cost(fing: Fingering, simultaneous: bool = True) -> float:
     """押さえ方そのものの弾きにくさ。simultaneous=False は、音が同時には鳴らない
     (順に押さえていく)まとまり用で、指の本数は数えない。"""
@@ -376,7 +410,7 @@ def shape_cost(fing: Fingering, simultaneous: bool = True) -> float:
     lo, hi = min(fretted), max(fretted)
     cost = 0.5 * (hi - lo) + 0.1 * hi  # 幅が狭く、ローポジションほど良い
     cost += 0.05 * len(fretted)        # 同じなら押さえる音が少ない(開放弦を使う)ほうを選ぶ
-    cost += INVERT_COST * max(0, inversion(fing) - 2)  # 低音弦だけ高いフレットになる形
+    cost += inversion_cost(fing)       # 低音弦だけ高いフレットになる形
     # ハイポジションで開放弦を混ぜる形は、音は出せても普通は選ばない
     cost += 0.4 * (len(fing) - len(fretted)) * max(0, lo - 4)
     fingers = len(fretted) - max(0, fretted.count(lo) - 1)  # 最低フレットはバレー可
@@ -935,7 +969,7 @@ def measure_difficulty(events: dict[int, Event], fingerings: dict[int, Fingering
                 fingers = len(own) - max(0, own.count(lo) - 1)
                 chord = max(chord, 0.7 if fingers >= 4 else 0.3 if fingers == 3 else 0.0)
             if len(fing) > 1:  # 低音弦だけ高いフレットになる形
-                chord = max(chord, min(2.0, 0.7 * max(0, inversion(fing) - 2)))
+                chord = max(chord, min(2.5, 0.7 * inversion_cost(fing)))
             if len(fing) > 1:  # 同時に弾く音の間で、必要以上に弦を飛ばす形
                 chord = max(chord, min(1.2, 0.6 * skip_cost((s, opens[s] + f) for s, f in fing)))
             if len(fing) == 1:
