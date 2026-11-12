@@ -43,6 +43,7 @@ AUTO_GRIDS = [4, 8, 12, 16, 24, 32, 48]
 MAX_CANDIDATES = 40  # 和音ごとに保持する運指候補の上限
 HAND_REACH = 3       # 手を動かさずに届く範囲: ポジション p なら p〜p+3 フレット
 MAX_GROUP_COST = 3.5  # アルペジオを1つのフォームとみなす上限(これより弾きにくければ分ける)
+INVERT_COST = 1.0       # 低音弦側が高音弦側より3フレット以上高い形の、超過1フレットあたりのコスト
 SKIP_COST = 2.0         # 同時に弾く音の間で、余分に飛ばす弦1本あたりのコスト
 RING_CUT = 1.0          # 鳴っている音と同じ弦を使って切ってしまうコスト(切れる長さ1拍あたり)
 SAME_SHAPE_MOVE = 0.25 # 同じフォームのまま1フレット動かすコスト(通常の移動は 1 + 固定1)
@@ -350,6 +351,22 @@ def skip_cost(notes) -> float:
     return cost
 
 
+def inversion(fing) -> int:
+    """低音弦側の指が、高音弦側の指より何フレット上(ブリッジ寄り)にあるか。
+
+    手の構造上、高音弦ほど上のフレットへ伸ばすのは楽だが、その逆(低音弦だけ高いフレット)は
+    難しい。Cコードのような2フレットまでの逆向きは普通なので、それを超えた分が問題になる。
+    """
+    fretted = sorted((s, f) for s, f in fing if f > 0)
+    worst = 0
+    lowest_seen = None  # ここまでの低音弦側で一番高いフレット
+    for _, fret in fretted:
+        if lowest_seen is not None:
+            worst = max(worst, lowest_seen - fret)
+        lowest_seen = fret if lowest_seen is None else max(lowest_seen, fret)
+    return worst
+
+
 def shape_cost(fing: Fingering, simultaneous: bool = True) -> float:
     """押さえ方そのものの弾きにくさ。simultaneous=False は、音が同時には鳴らない
     (順に押さえていく)まとまり用で、指の本数は数えない。"""
@@ -359,6 +376,7 @@ def shape_cost(fing: Fingering, simultaneous: bool = True) -> float:
     lo, hi = min(fretted), max(fretted)
     cost = 0.5 * (hi - lo) + 0.1 * hi  # 幅が狭く、ローポジションほど良い
     cost += 0.05 * len(fretted)        # 同じなら押さえる音が少ない(開放弦を使う)ほうを選ぶ
+    cost += INVERT_COST * max(0, inversion(fing) - 2)  # 低音弦だけ高いフレットになる形
     # ハイポジションで開放弦を混ぜる形は、音は出せても普通は選ばない
     cost += 0.4 * (len(fing) - len(fretted)) * max(0, lo - 4)
     fingers = len(fretted) - max(0, fretted.count(lo) - 1)  # 最低フレットはバレー可
@@ -842,7 +860,8 @@ def measure_difficulty(events: dict[int, Event], fingerings: dict[int, Fingering
       ストレッチ 同時に押さえているフレットの幅
       移動      左手のポジション移動の距離と、その間の時間
       弦飛び    速い単音フレーズでの2本以上離れた弦への移動
-      コード    押さえる指の本数、同時に弾く音の間で飛ばす弦の本数
+      コード    押さえる指の本数、同時に弾く音の間で飛ばす弦の本数、
+                低音弦だけ高いフレットになる逆向きの形
       ハイフレット 15フレットより上
       タッピング 右手で叩く音の数、低音弦、右手の跳躍
     """
@@ -915,6 +934,8 @@ def measure_difficulty(events: dict[int, Event], fingerings: dict[int, Fingering
                     high = 0.3
                 fingers = len(own) - max(0, own.count(lo) - 1)
                 chord = max(chord, 0.7 if fingers >= 4 else 0.3 if fingers == 3 else 0.0)
+            if len(fing) > 1:  # 低音弦だけ高いフレットになる形
+                chord = max(chord, min(2.0, 0.7 * max(0, inversion(fing) - 2)))
             if len(fing) > 1:  # 同時に弾く音の間で、必要以上に弦を飛ばす形
                 chord = max(chord, min(1.2, 0.6 * skip_cost((s, opens[s] + f) for s, f in fing)))
             if len(fing) == 1:

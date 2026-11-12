@@ -615,3 +615,18 @@ def test_octaves_use_one_string_skip_shape():
     assert m.skip_cost([(1, 48), (2, 52), (3, 55)]) == 0
     # ベースとメロディのように音程が広ければ、弦が離れていても減点しない
     assert m.skip_cost([(0, 40), (5, 76)]) == 0
+
+
+def test_low_string_on_higher_fret_is_avoided():
+    assert m.inversion(((1, 3), (2, 2), (4, 1))) == 2          # Cコード: 普通の形
+    assert m.inversion(((0, 7), (4, 3), (5, 3))) == 4          # 6弦だけ7フレット: 逆向きに4
+    assert m.inversion(((0, 3), (4, 3), (5, 7))) == 0          # 1弦だけ7フレットは問題なし
+    assert m.inversion(((0, 7), (3, 0), (5, 0))) == 0          # 開放弦は数えない
+    assert m.shape_cost(((0, 7), (4, 3), (5, 3))) > m.shape_cost(((0, 3), (4, 3), (5, 7))) + 1
+    # 7フレット付近のフレーズの直後でも、G/B は 6弦7 ではなく 5弦2 で押さえる
+    riff = [(i * 240, 230, p) for i, p in enumerate([64, 66, 67, 66])]          # 2弦5〜8フレットあたり
+    chord = [(960, 900, p) for p in (47, 55, 62, 67)]                           # B2, G3, D4, G4
+    score = m.analyze(raw_midi(riff + chord), grid=8)
+    shape = score.fingerings[4]
+    assert m.inversion(shape) <= 2, shape
+    assert (0, 7) not in shape
