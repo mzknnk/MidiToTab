@@ -43,6 +43,9 @@ AUTO_GRIDS = [4, 8, 12, 16, 24, 32, 48]
 MAX_CANDIDATES = 40  # 和音ごとに保持する運指候補の上限
 HAND_REACH = 3       # 手を動かさずに届く範囲: ポジション p なら p〜p+3 フレット
 MAX_GROUP_COST = 3.5  # アルペジオを1つのフォームとみなす上限(これより弾きにくければ分ける)
+SKIP_COST = 2.0         # 同時に弾く音の間で、余分に飛ばす弦1本あたりのコスト
+RING_CUT = 1.0          # 鳴っている音と同じ弦を使って切ってしまうコスト(切れる長さ1拍あたり)
+SAME_SHAPE_MOVE = 0.25 # 同じフォームのまま1フレット動かすコスト(通常の移動は 1 + 固定1)
 TAP_STRINGS = 4      # 右手で叩くのは高音側のこの本数の弦だけ(5・6弦は叩かない)
 TAP_COST = 2.5       # 右手タッピング1音のコスト(ポジション移動との比較用)
 
@@ -329,6 +332,24 @@ def enumerate_fingerings(pitches: list[int], opens: list[int],
     return results
 
 
+def skip_cost(notes) -> float:
+    """同時に弾く音の間で、必要以上に弦を飛ばす弾きにくさ。notes: (弦, 音高) の並び。
+
+    音程に対して自然な弦の間隔(5度までは隣の弦、オクターブ前後は1本飛ばし)より
+    多く飛ばすと、間の弦を余分にミュートしなければならない。ベースとメロディのように
+    もともと音程が広い組み合わせは、弦が離れていても減点しない。
+    """
+    used = sorted(set(notes))
+    cost = 0.0
+    for (a, pa), (b, pb) in zip(used, used[1:]):
+        gap = b - a - 1
+        interval = abs(pb - pa)
+        natural = 0 if interval <= 7 else 1 if interval <= 14 else 2 if interval <= 19 else 9
+        if gap > natural:
+            cost += SKIP_COST * (gap - natural)
+    return cost
+
+
 def shape_cost(fing: Fingering, simultaneous: bool = True) -> float:
     """押さえ方そのものの弾きにくさ。simultaneous=False は、音が同時には鳴らない
     (順に押さえていく)まとまり用で、指の本数は数えない。"""
@@ -394,6 +415,16 @@ class Cand:
     shape: float = 0.0               # 左手のフォームだけの弾きにくさ
 
 
+def shape_signature(cand: Cand):
+    """左手のフォームの「形」。同じ形なら、位置が違っても平行移動で弾ける。"""
+    fretted = [(s, f) for s, f in cand.left if f > 0]
+    if len(fretted) < 2:
+        return None
+    lo = min(f for _, f in fretted)
+    return (tuple(sorted((s, f - lo) for s, f in fretted)),
+            tuple(sorted(s for s, f in cand.left if f == 0)))
+
+
 def plain_cands(fingerings: list[Fingering]) -> list[Cand]:
     return [Cand(f, f, frozenset(), shape_cost(f), shape_cost(f)) for f in fingerings]
 
@@ -405,9 +436,11 @@ BEAM = 60               # まとまりの運指候補を何通りまで追うか
 class GroupBuilder:
     """音が重なって鳴り続けるイベントのまとまりと、その運指候補を育てる。
 
-    候補は「音高 → (弦, フレット, 右手で叩くか)」の割り当て。同時に鳴る音どうしは
-    別の弦に置き、左手の音は1つのフォーム(max_span 以内)に収める。重ならない音は
-    同じ弦を使ってよい(コードを押さえたままメロディが動く形)。
+    候補は「音高 → (弦, フレット, 右手で叩くか)」の割り当て。同時に弾く音どうしは
+    必ず別の弦に置き、左手の音は1つのフォーム(max_span 以内)に収める。
+    前の音がまだ鳴っている弦で次の音を弾くと前の音が切れるので、それは減点にとどめる
+    (鳴らしっぱなしのアルペジオは別々の弦が選ばれやすく、同じ形で動くオクターブ奏法などは
+    同じ弦を使える)。重ならない音は自由に同じ弦を使ってよい。
     """
 
     def __init__(self, opens: list[int], max_fret: int, max_span: int, tpb: int, tapping: bool,
@@ -417,19 +450,25 @@ class GroupBuilder:
         self.events: list[Event] = []
         self.spans: dict[int, list[tuple[int, int]]] = {}   # 音高 → 鳴っている区間
         self.beam: list[tuple[float, float, dict[int, tuple[int, int, bool]]]] = []
+        self.hard: set[frozenset] = set()   # 同時に弾く音の組(同じ弦には置けない)
+        # 鳴っている間に次が始まる音の組 → 同じ弦に置くと切れてしまう長さ(拍)
+        self.soft: dict[frozenset, float] = {}
 
     def start(self, ev: Event) -> bool:
         """ev から新しいまとまりを始める。和音として押さえられなければ False。"""
         self.events, self.spans, self.beam = [], {}, [(0.0, 0.0, {})]
+        self.hard, self.soft = set(), {}
         return self.add(ev)
 
-    def conflicts(self, p: int, q: int) -> bool:
+    def overlap_beats(self, p: int, q: int) -> float:
+        """p と q が重なって鳴る長さ(拍)。重なりとみなせないほど短ければ 0。"""
+        longest = 0.0
         for a0, a1 in self.spans[p]:
             for b0, b1 in self.spans[q]:
                 overlap = min(a1, b1) - max(a0, b0)
                 if overlap > 0 and overlap >= min(self.tpb / 8, (a1 - a0) / 2, (b1 - b0) / 2):
-                    return True
-        return False
+                    longest = max(longest, overlap / self.tpb)
+        return min(longest, 2.0)
 
     def score(self, places: dict[int, tuple[int, int, bool]]) -> tuple[float, float] | None:
         left = tuple((s, f) for s, f, tap in places.values() if not tap)
@@ -441,19 +480,39 @@ class GroupBuilder:
         if taps and (rng is None or min(taps) < rng[1] + 2):
             return None  # 右手は左手のフォームより上を叩く
         shape = shape_cost(left, simultaneous=len(self.events) <= 1)
+        # 同時に弾く音どうしの弦飛び
+        shape += sum(skip_cost((places[p][0], p) for p in ev.ends if p in places)
+                     for ev in self.events if len(ev.ends) > 1)
+        # 鳴っている音と同じ弦を使って、その音を切ってしまう組
+        shape += RING_CUT * sum(lost for pair, lost in self.soft.items()
+                                if all(p in places for p in pair)
+                                and len({places[p][0] for p in pair}) == 1)
         # 右手で叩くのは高音弦が普通。低音弦ほど不自然なので避ける
         return shape + TAP_COST * len(taps) + 0.05 * sum(taps) + 0.4 * low_strings, shape
 
     def add(self, ev: Event) -> bool:
         """ev をまとまりに加える。無理のない運指が残らなければ何も変えず False。"""
         old_spans = {p: list(v) for p, v in self.spans.items()}
+        old_pairs = (set(self.hard), dict(self.soft))
         for p, end in ev.ends.items():
             self.spans.setdefault(p, []).append((ev.on_tick, end))
+        for p in ev.ends:
+            for q in self.spans:
+                pair = frozenset((p, q))
+                if q == p or pair in self.hard:
+                    continue
+                if q in ev.ends:
+                    self.hard.add(pair)
+                    self.soft.pop(pair, None)
+                else:
+                    lost = self.overlap_beats(p, q)
+                    if lost:
+                        self.soft[pair] = max(lost, self.soft.get(pair, 0.0))
         ok = len(self.spans) <= MAX_GROUP_PITCHES
         beam = self.beam if ok else []
         self.events.append(ev)
         for p in sorted(ev.ends):
-            clash = [q for q in self.spans if q != p and self.conflicts(p, q)]
+            clash = [q for q in self.spans if frozenset((p, q)) in self.hard]
             grown = []
             for _, _, places in beam:
                 if p in places:  # すでに場所が決まっている音: 新しく重なる音と弦がぶつからないか
@@ -466,7 +525,8 @@ class GroupBuilder:
                     if string in busy or not 0 <= fret <= self.max_fret:
                         continue
                     grown.append({**places, p: (string, fret, False)})
-                    if (self.tapping and len(self.events) > 1 and fret > 0
+                    # 右手で叩くのは単音だけ(同時に弾く和音の片方だけを叩く形にはしない)
+                    if (self.tapping and len(self.events) > 1 and fret > 0 and len(ev.ends) == 1
                             and string >= len(self.opens) - TAP_STRINGS
                             and (self.tap_steps is None or ev.step in self.tap_steps)):
                         grown.append({**places, p: (string, fret, True)})
@@ -482,11 +542,16 @@ class GroupBuilder:
             return True
         self.events.pop()
         self.spans = old_spans
+        self.hard, self.soft = old_pairs
         return False
 
     def candidates(self) -> list[Cand]:
         out = []
+        # 複数のイベントをまとめた場合、無理のあるフォームは候補に残さない
+        limit = MAX_GROUP_COST if len(self.events) > 1 else float("inf")
         for cost, shape, places in self.beam:
+            if shape > limit:
+                continue
             fing = tuple(sorted((s, f) for s, f, _ in places.values()))
             left = tuple(sorted((s, f) for s, f, tap in places.values() if not tap))
             taps = frozenset((s, f) for s, f, tap in places.values() if tap)
@@ -552,18 +617,25 @@ def assign_fingerings(events: dict[int, Event], opens: list[int], grid: int,
         return (0 < i < len(units) and single(i - 1) and single(i)
                 and is_legato(units[i - 1][0], units[i][0], tpb))
 
+    signatures = [[shape_signature(c) for c in cands] for cands in cand_lists]
     # 状態 = (累積コスト, 直前の状態index, 候補index, 左手ポジション, タッピングか)
     # ポジションは「まだ決まっていない」場合 None (開放弦だけで始まる曲など)
     layers: list[list[tuple[float, int, int, int | None, bool]]] = []
     for i, cands in enumerate(cand_lists):
+        prev_shapes: dict = {}  # フォームの形 → ポジションごとの最良の直前状態
         if i == 0:
             prev_best = {None: (0.0, -1)}
             move_weight = 0.0
         else:
             prev_best = {}  # ポジションごとの最良の直前状態
-            for k, (cost, _, _, pos, _) in enumerate(layers[-1]):
+            for k, (cost, _, pci, pos, _) in enumerate(layers[-1]):
                 if pos not in prev_best or cost < prev_best[pos][0]:
                     prev_best[pos] = (cost, k)
+                sig = signatures[i - 1][pci]
+                if sig is not None and pos is not None:
+                    same = prev_shapes.setdefault(sig, {})
+                    if pos not in same or cost < same[pos][0]:
+                        same[pos] = (cost, k)
             gap_beats = (units[i][0].step - units[i - 1][-1].step) * 4 / grid
             move_weight = 1.0 / (1.0 + gap_beats / 2)  # 間が空くほど移動は楽
         can_tap = (tapping and (legato_into(i) or legato_into(i + 1))
@@ -583,6 +655,11 @@ def assign_fingerings(events: dict[int, Event], opens: list[int], grid: int,
                     # 移動距離に加え、ポジション移動そのものにも固定コスト
                     total = pcost + (dist + 1.0 if dist else 0.0) * move_weight
                     if best is None or total < best[0]:
+                        best = (total, k)
+                # 直前と同じ形のまま平行移動するのは楽(オクターブ奏法やパワーコードの移動)
+                for ppos, (pcost, k) in prev_shapes.get(signatures[i][ci], {}).items():
+                    total = pcost + SAME_SHAPE_MOVE * abs(pos - ppos) * move_weight
+                    if total < best[0]:
                         best = (total, k)
                 layer.append((best[0] + sc, best[1], ci, pos, False))
             if can_tap and cand.left[0][0] >= len(opens) - TAP_STRINGS:
@@ -756,7 +833,8 @@ def difficulty_level(points: float) -> int:
 
 def measure_difficulty(events: dict[int, Event], fingerings: dict[int, Fingering],
                        tapped: set[int], dead: set[int], measures: list[Measure],
-                       grid: int, tpb: int, bpm: float | None) -> dict[int, float]:
+                       grid: int, tpb: int, bpm: float | None,
+                       opens: list[int]) -> dict[int, float]:
     """小節ごとの弾きにくさの点数 (小節index → 点数)。difficulty_level で段階にする。
 
     見ているもの:
@@ -764,7 +842,7 @@ def measure_difficulty(events: dict[int, Event], fingerings: dict[int, Fingering
       ストレッチ 同時に押さえているフレットの幅
       移動      左手のポジション移動の距離と、その間の時間
       弦飛び    速い単音フレーズでの2本以上離れた弦への移動
-      コード    押さえる指の本数
+      コード    押さえる指の本数、同時に弾く音の間で飛ばす弦の本数
       ハイフレット 15フレットより上
       タッピング 右手で叩く音の数、低音弦、右手の跳躍
     """
@@ -775,6 +853,7 @@ def measure_difficulty(events: dict[int, Event], fingerings: dict[int, Fingering
     prev_step: int | None = None
     prev_single: tuple[int, int] | None = None   # 直前の単音 (弦, ステップ)
     prev_tap: int | None = None
+    prev_form = None                     # 直前に押さえたフォームの形
     i = 0
     for mi, (ms, ml, _, _) in enumerate(measures):
         in_bar = []
@@ -803,11 +882,15 @@ def measure_difficulty(events: dict[int, Event], fingerings: dict[int, Fingering
                 continue
             own = [f for _, f in fing if f > 0]
             held = list(own)   # いま押さえたままになっている音も含めたフレット
-            for j in range(max(0, k - 8), k):
+            reused = {s for s, _ in fing}   # あとから別の音を弾いた弦(前の音はもう鳴っていない)
+            for j in range(k - 1, max(0, k - 8) - 1, -1):
                 p = steps[j]
                 if p not in tapped and p not in dead \
                         and events[p].end_tick > events[step].on_tick + tpb / 8:
-                    held += [f for _, f in fingerings[p] if f > 0]
+                    held += [f for s, f in fingerings[p] if f > 0 and s not in reused]
+                reused |= {s for s, _ in fingerings[p]}
+            if held and max(held) - min(held) > 4 and own:
+                held = own  # 押さえたままでは届かない: 前の音は離して弾くものとみなす
             if held:
                 span = max(held) - min(held)
                 stretch = max(stretch, 0.0 if span <= 2 else 1.0 if span == 3
@@ -819,14 +902,21 @@ def measure_difficulty(events: dict[int, Event], fingerings: dict[int, Fingering
                     new = lo
                 elif hi > pos + HAND_REACH:
                     new = min(lo, hi - HAND_REACH)
+                form = (tuple(sorted((s, f - lo) for s, f in fing if f > 0))
+                        if len(own) >= 2 else None)
                 if pos is not None and new != pos and prev_step is not None:
                     gap = max(0, step - prev_step) * sec
-                    shift += min(2.0, abs(new - pos) / (4 * (gap + 0.15)))
+                    move = min(2.0, abs(new - pos) / (4 * (gap + 0.15)))
+                    # 同じ形のままの平行移動(オクターブ奏法など)は楽
+                    shift += move * (SAME_SHAPE_MOVE if form and form == prev_form else 1.0)
                 pos = new
+                prev_form = form
                 if hi > 15:
                     high = 0.3
                 fingers = len(own) - max(0, own.count(lo) - 1)
                 chord = max(chord, 0.7 if fingers >= 4 else 0.3 if fingers == 3 else 0.0)
+            if len(fing) > 1:  # 同時に弾く音の間で、必要以上に弦を飛ばす形
+                chord = max(chord, min(1.2, 0.6 * skip_cost((s, opens[s] + f) for s, f in fing)))
             if len(fing) == 1:
                 if prev_single and abs(fing[0][0] - prev_single[0]) >= 2 \
                         and (step - prev_single[1]) * sec < 0.25:
@@ -849,7 +939,7 @@ def choose_tap_steps(events: dict[int, Event], measures: list[Measure], opens: l
     """
     plain = assign_fingerings(events, opens, grid, max_fret, max_span, tpb)
     tap = assign_fingerings(events, opens, grid, max_fret, max_span, tpb, tapping=True)
-    args = (set(), measures, grid, tpb, bpm)
+    args = (set(), measures, grid, tpb, bpm, opens)
     d_plain = measure_difficulty(events, plain.fingerings, plain.tapped, *args)
     d_tap = measure_difficulty(events, tap.fingerings, tap.tapped, *args)
     tapped_bars = {next(i for i, m in enumerate(measures) if m[0] <= s < m[0] + m[1])
@@ -1097,7 +1187,7 @@ def analyze(mid: mido.MidiFile, *, tuning: str = "standard", capo: int = 0,
                  asg.tapped, techs, ringing, names, first, rhythm, warnings, tpb, max_fret, marks,
                  find_sections(song, measures, step_ticks),
                  measure_difficulty(events, asg.fingerings, asg.tapped, dead_steps, measures,
-                                    grid, tpb, song.bpm),
+                                    grid, tpb, song.bpm, opens),
                  song.tempos)
 
 

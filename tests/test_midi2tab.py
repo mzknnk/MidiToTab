@@ -592,3 +592,26 @@ def test_string_edits_in_one_chord_do_not_depend_on_order():
     # 2つの音を同じ弦に動かす指定は、あとの1つだけ取り消す
     both = {"0:52": {"string": 0}, "0:48": {"string": 0}}
     assert len({s for s, _ in m.analyze(raw_midi(chord), grid=4, edits={"notes": both}).fingerings[0]}) == 3
+
+
+def test_octaves_use_one_string_skip_shape():
+    # E4+E5, G4+G5, F4+F5 のオクターブ。4弦+1弦(2本飛ばし)より、3弦+1弦 / 4弦+2弦 の
+    # 1本飛ばしの形を選ぶ
+    notes = []
+    for i, low in enumerate([64, 67, 65, 64]):
+        notes += [(i * 480, 400, low), (i * 480, 400, low + 12)]
+    score = m.analyze(raw_midi(notes), grid=4)
+    for step, fing in score.fingerings.items():
+        (s1, f1), (s2, f2) = fing
+        assert s2 - s1 == 2, (step, fing)          # 間の弦は1本だけ
+        assert abs(f2 - f1) <= 3
+    assert score.fingerings[0] == ((3, 9), (5, 12))  # 3弦9 + 1弦12
+    # 音が伸びて次のオクターブと重なっていても同じ
+    ringing = [(on, 900, p) for on, _, p in notes]
+    for fing in m.analyze(raw_midi(ringing), grid=4).fingerings.values():
+        assert fing[1][0] - fing[0][0] == 2
+    # オクターブ(12半音)は1本飛ばしが自然。2本飛ばしは減点、隣の弦どうしの和音は減点なし
+    assert m.skip_cost([(3, 64), (5, 76)]) == 0 < m.skip_cost([(2, 64), (5, 76)])
+    assert m.skip_cost([(1, 48), (2, 52), (3, 55)]) == 0
+    # ベースとメロディのように音程が広ければ、弦が離れていても減点しない
+    assert m.skip_cost([(0, 40), (5, 76)]) == 0
