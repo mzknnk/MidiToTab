@@ -323,17 +323,19 @@ def enumerate_fingerings(pitches: list[int], opens: list[int],
     return results
 
 
-def shape_cost(fing: Fingering) -> float:
-    """押さえ方そのものの弾きにくさ。"""
+def shape_cost(fing: Fingering, simultaneous: bool = True) -> float:
+    """押さえ方そのものの弾きにくさ。simultaneous=False は、音が同時には鳴らない
+    (順に押さえていく)まとまり用で、指の本数は数えない。"""
     fretted = [f for _, f in fing if f > 0]
     if not fretted:
         return 0.0
     lo, hi = min(fretted), max(fretted)
     cost = 0.5 * (hi - lo) + 0.1 * hi  # 幅が狭く、ローポジションほど良い
+    cost += 0.05 * len(fretted)        # 同じなら押さえる音が少ない(開放弦を使う)ほうを選ぶ
     # ハイポジションで開放弦を混ぜる形は、音は出せても普通は選ばない
     cost += 0.4 * (len(fing) - len(fretted)) * max(0, lo - 4)
     fingers = len(fretted) - max(0, fretted.count(lo) - 1)  # 最低フレットはバレー可
-    if fingers > 4:
+    if simultaneous and fingers > 4:
         cost += 10.0
     return cost
 
@@ -376,24 +378,143 @@ def is_legato(prev: Event, cur: Event, tpb: int) -> bool:
     return cur.on_tick - tpb / 8 <= prev.end_tick <= cur.on_tick + tpb / 4
 
 
-def group_ringing(events: list[Event], opens: list[int], max_fret: int,
-                  max_span: int, tpb: int) -> list[list[Event]]:
-    """鳴らしっぱなしで重なっていく音(let ring のアルペジオ)をまとめる。
+@dataclass(frozen=True)
+class Cand:
+    """運指の候補。右手で叩く音がある場合、左手のフォームは left だけで決まる。"""
+    fing: Fingering                  # すべての音
+    left: Fingering                  # 左手で押さえる音
+    taps: frozenset = frozenset()    # 右手で叩く (弦, フレット)
+    cost: float = 0.0                # 弾きにくさ(タッピングの手間を含む)
+    shape: float = 0.0               # 左手のフォームだけの弾きにくさ
 
-    まとめた音は同時に押さえている必要があるので、1つの和音として運指を決める。
-    和音として押さえられない組み合わせになったら、そこで区切る。
+
+def plain_cands(fingerings: list[Fingering]) -> list[Cand]:
+    return [Cand(f, f, frozenset(), shape_cost(f), shape_cost(f)) for f in fingerings]
+
+
+MAX_GROUP_PITCHES = 8   # 1つのまとまりで扱う音高の数の上限
+BEAM = 60               # まとまりの運指候補を何通りまで追うか
+
+
+class GroupBuilder:
+    """音が重なって鳴り続けるイベントのまとまりと、その運指候補を育てる。
+
+    候補は「音高 → (弦, フレット, 右手で叩くか)」の割り当て。同時に鳴る音どうしは
+    別の弦に置き、左手の音は1つのフォーム(max_span 以内)に収める。重ならない音は
+    同じ弦を使ってよい(コードを押さえたままメロディが動く形)。
     """
-    groups = [[events[0]]]
-    for prev, ev in zip(events, events[1:]):
-        union = sorted({p for e in groups[-1] for p in e.ends} | set(ev.ends))
-        shapes = (enumerate_fingerings(union, opens, max_fret, max_span)
-                  if prev.min_end_tick > ev.on_tick + tpb / 4 and len(union) <= len(opens) else [])
-        # 無理のないフォームで押さえられるときだけ、まとめて1つのコードとして扱う
-        if shapes and min(map(shape_cost, shapes)) <= MAX_GROUP_COST:
-            groups[-1].append(ev)
-        else:
-            groups.append([ev])
-    return groups
+
+    def __init__(self, opens: list[int], max_fret: int, max_span: int, tpb: int, tapping: bool):
+        self.opens, self.max_fret, self.max_span = opens, max_fret, max_span
+        self.tpb, self.tapping = tpb, tapping
+        self.events: list[Event] = []
+        self.spans: dict[int, list[tuple[int, int]]] = {}   # 音高 → 鳴っている区間
+        self.beam: list[tuple[float, float, dict[int, tuple[int, int, bool]]]] = []
+
+    def start(self, ev: Event) -> bool:
+        """ev から新しいまとまりを始める。和音として押さえられなければ False。"""
+        self.events, self.spans, self.beam = [], {}, [(0.0, 0.0, {})]
+        return self.add(ev)
+
+    def conflicts(self, p: int, q: int) -> bool:
+        for a0, a1 in self.spans[p]:
+            for b0, b1 in self.spans[q]:
+                overlap = min(a1, b1) - max(a0, b0)
+                if overlap > 0 and overlap >= min(self.tpb / 8, (a1 - a0) / 2, (b1 - b0) / 2):
+                    return True
+        return False
+
+    def score(self, places: dict[int, tuple[int, int, bool]]) -> tuple[float, float] | None:
+        left = tuple((s, f) for s, f, tap in places.values() if not tap)
+        taps = [f for _, f, tap in places.values() if tap]
+        rng = fret_range(left)
+        if rng and rng[1] - rng[0] > self.max_span:
+            return None
+        if taps and (rng is None or min(taps) < rng[1] + 2):
+            return None  # 右手は左手のフォームより上を叩く
+        shape = shape_cost(left, simultaneous=len(self.events) <= 1)
+        return shape + TAP_COST * len(taps) + 0.05 * sum(taps), shape
+
+    def add(self, ev: Event) -> bool:
+        """ev をまとまりに加える。無理のない運指が残らなければ何も変えず False。"""
+        old_spans = {p: list(v) for p, v in self.spans.items()}
+        for p, end in ev.ends.items():
+            self.spans.setdefault(p, []).append((ev.on_tick, end))
+        ok = len(self.spans) <= MAX_GROUP_PITCHES
+        beam = self.beam if ok else []
+        self.events.append(ev)
+        for p in sorted(ev.ends):
+            clash = [q for q in self.spans if q != p and self.conflicts(p, q)]
+            grown = []
+            for _, _, places in beam:
+                if p in places:  # すでに場所が決まっている音: 新しく重なる音と弦がぶつからないか
+                    if all(q not in places or places[q][0] != places[p][0] for q in clash):
+                        grown.append(places)
+                    continue
+                busy = {places[q][0] for q in clash if q in places}
+                for string, open_pitch in enumerate(self.opens):
+                    fret = p - open_pitch
+                    if string in busy or not 0 <= fret <= self.max_fret:
+                        continue
+                    grown.append({**places, p: (string, fret, False)})
+                    if self.tapping and len(self.events) > 1 and fret > 0:
+                        grown.append({**places, p: (string, fret, True)})
+            scored = []
+            for places in grown:
+                sc = self.score(places)
+                if sc:
+                    scored.append((sc[0], sc[1], places))
+            scored.sort(key=lambda c: c[0])
+            beam = scored[:BEAM]
+        if beam and (len(self.events) == 1 or min(c[1] for c in beam) <= MAX_GROUP_COST):
+            self.beam = beam
+            return True
+        self.events.pop()
+        self.spans = old_spans
+        return False
+
+    def candidates(self) -> list[Cand]:
+        out = []
+        for cost, shape, places in self.beam:
+            fing = tuple(sorted((s, f) for s, f, _ in places.values()))
+            left = tuple(sorted((s, f) for s, f, tap in places.values() if not tap))
+            taps = frozenset((s, f) for s, f, tap in places.values() if tap)
+            out.append(Cand(fing, left, taps, cost, shape))
+        return out[:MAX_CANDIDATES]
+
+
+def build_units(events: list[Event], opens: list[int], max_fret: int, max_span: int,
+                tpb: int, tapping: bool) -> tuple[list[list[Event]], list[list[Cand]], int]:
+    """イベントを「運指を一緒に決めるまとまり」に分け、それぞれの候補を作る。
+
+    前の音がまだ鳴っているうちに始まる音は同じまとまりに入れる(let ring のアルペジオや、
+    コードを押さえたままのメロディ)。戻り値: (まとまり, 候補, 省いた音の数)
+    """
+    units: list[list[Event]] = []
+    cand_lists: list[list[Cand]] = []
+    dropped = 0
+    builder = GroupBuilder(opens, max_fret, max_span, tpb, tapping)
+    active = False
+
+    def flush():
+        if active:
+            units.append(list(builder.events))
+            cand_lists.append(builder.candidates())
+
+    for ev in events:
+        ringing = active and max(e.end_tick for e in builder.events) > ev.on_tick + tpb / 4
+        if ringing and builder.add(ev):
+            continue
+        flush()
+        active = builder.start(ev)
+        if not active:  # 単独でも押さえられない和音: 音を省いて候補を作る
+            shapes, lost = playable_candidates(ev.pitches, opens, max_fret, max_span)
+            dropped += lost
+            if shapes:
+                units.append([ev])
+                cand_lists.append(plain_cands(shapes))
+    flush()
+    return units, cand_lists, dropped
 
 
 def assign_fingerings(events: dict[int, Event], opens: list[int], grid: int,
@@ -401,31 +522,18 @@ def assign_fingerings(events: dict[int, Event], opens: list[int], grid: int,
                       tapping: bool = False) -> Assignment:
     """曲全体で左手の移動が最小になるよう、各和音の運指を選ぶ(ビタビ)。
 
-    tapping=True のとき、レガートでつながる単音は「左手を動かさず右手で
-    タッピングする」選択肢も候補に入れる。
+    tapping=True のとき、「左手を動かさず右手でタッピングする」選択肢も候補に入れる:
+    レガートでつながる単音と、鳴らしっぱなしのコードの上に乗る高い音が対象。
     """
-    units: list[list[Event]] = []  # 運指を一緒に決めるイベントのまとまり
-    cand_lists = []
-    dropped_total = 0
     if not events:
         return Assignment({}, set(), 0)
-    for group in group_ringing(list(events.values()), opens, max_fret, max_span, tpb):
-        if len(group) > 1:
-            union = sorted({p for e in group for p in e.ends})
-            cands = sorted(enumerate_fingerings(union, opens, max_fret, max_span),
-                           key=shape_cost)[:MAX_CANDIDATES]
-            dropped = 0
-        else:
-            cands, dropped = playable_candidates(group[0].pitches, opens, max_fret, max_span)
-        dropped_total += dropped
-        if cands:
-            units.append(group)
-            cand_lists.append(cands)
+    units, cand_lists, dropped_total = build_units(list(events.values()), opens, max_fret,
+                                                   max_span, tpb, tapping)
     if not units:
         return Assignment({}, set(), dropped_total)
 
     def single(i: int) -> bool:
-        return len(units[i]) == 1 and len(cand_lists[i][0]) == 1
+        return len(units[i]) == 1 and len(cand_lists[i][0].fing) == 1
 
     def legato_into(i: int) -> bool:
         return (0 < i < len(units) and single(i - 1) and single(i)
@@ -448,8 +556,8 @@ def assign_fingerings(events: dict[int, Event], opens: list[int], grid: int,
         can_tap = tapping and (legato_into(i) or legato_into(i + 1))
         layer = []
         for ci, cand in enumerate(cands):
-            sc = shape_cost(cand)
-            rng = fret_range(cand)
+            sc = cand.cost
+            rng = fret_range(cand.left)
             if rng is None:  # 開放弦だけなら手は動かない
                 layer.extend((pcost + sc, k, ci, ppos, False)
                              for ppos, (pcost, k) in prev_best.items())
@@ -475,9 +583,11 @@ def assign_fingerings(events: dict[int, Event], opens: list[int], grid: int,
     tapped = set()
     for i in range(len(units) - 1, -1, -1):
         _, prev_j, ci, _, tap = layers[i][j]
+        cand = cand_lists[i][ci]
         for ev in units[i]:  # まとまりの運指から、各イベントで弾く弦だけ取り出す
-            result[ev.step] = tuple((st, f) for st, f in cand_lists[i][ci]
-                                    if opens[st] + f in ev.ends)
+            result[ev.step] = tuple((st, f) for st, f in cand.fing if opens[st] + f in ev.ends)
+            if any(note in cand.taps for note in result[ev.step]):
+                tapped.add(ev.step)
         if tap:
             tapped.add(units[i][0].step)
         j = prev_j
@@ -768,7 +878,17 @@ def analyze(mid: mido.MidiFile, *, tuning: str = "standard", capo: int = 0,
     warnings: list[str] = []
     opens = [p + capo for p in parse_tuning(tuning)]
     max_fret -= capo
+    top = max(opens) + max_fret
     song = load_song(mid, tracks, channels, transpose, frozenset(dead_notes or ()))
+    if dead_notes is None:
+        # 指定が無ければ、ギターで弾けない高さの音を空ピッキング用のキーとみなして X で出す
+        high = collections.Counter(n.pitch for n in song.notes if n.pitch > top)
+        if high:
+            song = load_song(mid, tracks, channels, transpose, frozenset(high))
+            names = ", ".join(f"{pitch_class_name(p)}{p // 12 - 1}(ノート番号{p})×{c}"
+                              for p, c in sorted(high.items()))
+            warnings.append(f"音域より高い {sum(high.values())} 音を X (空ピッキング)として表示しました: "
+                            f"{names}。不要なら --dead-notes none")
     if not song.notes:
         raise ValueError("ノートが見つかりません(トラック/チャンネル指定を確認してください)")
     tpb = song.ticks_per_beat
@@ -781,16 +901,14 @@ def analyze(mid: mido.MidiFile, *, tuning: str = "standard", capo: int = 0,
         song.notes = [n for n in song.notes if n.off - n.on >= tpb / 32]
         warnings.append(f"ごく短い {len(tiny)} 音を無視しました")
 
-    # 音域より高い音は弾けない(音源のキースイッチであることが多い)ので無視する。
+    # dead_notes に入らなかった音域より高い音は弾けないので無視する。
     # 低すぎる音はオクターブ上げて収める
-    top = max(opens) + max_fret
     too_high = collections.Counter(n.pitch for n in song.notes if n.pitch > top)
     song.notes = [n for n in song.notes if n.pitch <= top]
     if too_high:
         names = ", ".join(f"{pitch_class_name(p)}{p // 12 - 1}(ノート番号{p})×{c}"
                           for p, c in sorted(too_high.items()))
-        warnings.append(f"音域より高い {sum(too_high.values())} 音を無視しました: {names}。"
-                        "空ピッキング用のキーなら --dead-notes で X として表示できます")
+        warnings.append(f"音域より高い {sum(too_high.values())} 音を無視しました: {names}")
     if not song.notes:
         raise ValueError("このチューニングで弾ける音がありません")
     shifted = 0
@@ -997,6 +1115,10 @@ def int_list(text: str) -> list[int]:
     return [int(x) for x in text.split(",") if x.strip()]
 
 
+def dead_note_list(text: str) -> list[int]:
+    return [] if text.strip().lower() in ("none", "") else int_list(text)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="ギターのMIDIファイルをTAB譜に書き起こす")
     ap.add_argument("midi", help="入力MIDIファイル")
@@ -1022,8 +1144,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="音が切れずにつながる同一弦の音を H(ハンマリング)/P(プリング) と推定する")
     ap.add_argument("--tapping", action=argparse.BooleanOptionalAction,
                     help="左手が届かないレガートの音を T(タッピング) と推定する (--legato を含む)")
-    ap.add_argument("--dead-notes", type=int_list,
-                    help="空ピッキング(ブラッシング)を表すノート番号(カンマ区切り)。X として表示する")
+    ap.add_argument("--dead-notes", type=dead_note_list,
+                    help="空ピッキング(ブラッシング)を表すノート番号(カンマ区切り)。X として表示する。"
+                         "既定はギターの音域より高い音すべて。none で無視")
     ap.add_argument("--expression", action=argparse.BooleanOptionalAction,
                     help="ピッチベンドからチョーキング・ビブラートを推定 (既定で有効)")
     ap.add_argument("--chords", action=argparse.BooleanOptionalAction,

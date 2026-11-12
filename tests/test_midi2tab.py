@@ -448,9 +448,14 @@ def test_grace_note_becomes_slide_in():
 def test_keyswitch_notes_ignored_or_shown_as_dead_strums():
     chord = [(0, 400, p) for p in (45, 53, 60, 64)]
     notes = chord + [(240, 60, 94), (360, 60, 93), (480, 400, 62)]
-    plain = m.analyze(raw_midi(notes), grid=16)
-    assert sorted(plain.fingerings) == [0, 4]
-    assert "ノート番号93" in plain.warnings[0] and "--dead-notes" in plain.warnings[0]
+    ignored = m.analyze(raw_midi(notes), grid=16, dead_notes=[])
+    assert sorted(ignored.fingerings) == [0, 4]
+    assert "無視" in ignored.warnings[0] and "ノート番号93" in ignored.warnings[0]
+    assert m.dead_note_list("none") == [] and m.dead_note_list("93,94") == [93, 94]
+
+    # 指定しなければ、音域より高い音は自動で X になる
+    auto = m.analyze(raw_midi(notes), grid=16)
+    assert auto.marks == {2: ["x"], 3: ["x"]} and "ノート番号93" in auto.warnings[0]
 
     score = m.analyze(raw_midi(notes), grid=16, dead_notes=[93, 94])
     assert score.warnings == []
@@ -474,3 +479,30 @@ def test_sections_from_markers_and_track_listing(tmp_path, capsys):
     assert m.main([str(path), "--list"]) == 0
     out = capsys.readouterr().out
     assert "Lead_Gt1 / Lead_Gt2" in out and "位置=4-8拍" in out
+
+
+def test_two_hand_tapping_over_held_chord():
+    # 6弦開放を含む低いコードを鳴らしっぱなしにした上に、高い音が短く入る。
+    # 左手は届かないので、高い音は右手で叩く
+    held = [(0, 1900, 40), (30, 1900, 47), (60, 1900, 52)]
+    high = [(960, 200, 76), (1200, 200, 79)]
+    mid = raw_midi(held + high + [(1920, 480, 40)])
+    plain = m.analyze(mid, grid=8)
+    tap = m.analyze(mid, grid=8, tapping=True)
+    assert plain.tapped == set()
+    assert tap.tapped == {4, 5}
+    assert tap.fingerings[0] == ((0, 0), (1, 2), (2, 2))    # 左手はローポジションのまま
+    assert tap.fingerings[4] == ((5, 12),) and tap.fingerings[5] == ((5, 15),)
+    assert tap.techs[4][0] == "T" and tap.techs[5][0] == "T"
+
+
+def test_melody_over_held_bass_shares_strings():
+    # ベースを伸ばしたまま、重ならないメロディが動く: メロディは同じ弦を使ってよい
+    notes = [(0, 1900, 45)] + [(i * 240, 230, p) for i, p in enumerate([64, 65, 67, 69, 67, 65, 64, 62])]
+    score = m.analyze(raw_midi(notes), grid=8)
+    assert score.warnings == []
+    strings = [s for step in sorted(score.fingerings) for s, f in score.fingerings[step] if (s, f) != (1, 0)]
+    assert score.fingerings[0][0] == (1, 0)                  # ベースは5弦開放
+    assert 1 not in strings                                  # 鳴っているベースの弦は使わない
+    frets = [f for step in sorted(score.fingerings) for s, f in score.fingerings[step] if s != 1 and f]
+    assert max(frets) - min(frets) <= 4
