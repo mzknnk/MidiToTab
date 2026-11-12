@@ -45,6 +45,7 @@ MAX_CANDIDATES = 40  # 和音ごとに保持する運指候補の上限
 HAND_REACH = 3       # 手を動かさずに届く範囲: ポジション p なら p〜p+3 フレット
 MAX_GROUP_COST = 3.5  # アルペジオを1つのフォームとみなす上限(これより弾きにくければ分ける)
 SKIP_COST = 2.0         # 同時に弾く音の間で、余分に飛ばす弦1本あたりのコスト
+MELODY_STRING_COST = 0.35  # アルペジオ＋メロディで、メロディを4弦より低い弦に置くコスト(弦1本あたり)
 RING_CUT = 1.0          # 鳴っている音と同じ弦を使って切ってしまうコスト(切れる長さ1拍あたり)
 SAME_SHAPE_MOVE = 0.25 # 同じフォームのまま1フレット動かすコスト(通常の移動は 1 + 固定1)
 TAP_STRINGS = 4      # 右手で叩くのは高音側のこの本数の弦だけ(5・6弦は叩かない)
@@ -497,9 +498,11 @@ class GroupBuilder:
     """
 
     def __init__(self, opens: list[int], max_fret: int, max_span: int, tpb: int, tapping: bool,
-                 tap_steps: set[int] | None = None):
+                 tap_steps: set[int] | None = None, styles: dict[int, str] | None = None):
         self.opens, self.max_fret, self.max_span = opens, max_fret, max_span
         self.tpb, self.tapping, self.tap_steps = tpb, tapping, tap_steps
+        self.styles = styles or {}          # ステップ → 奏法 (textures.py)
+        self.melody: set[int] = set()       # 「アルペジオ＋メロディ」の区間でメロディとみなす音高
         self.events: list[Event] = []
         self.spans: dict[int, list[tuple[int, int]]] = {}   # 音高 → 鳴っている区間
         self.beam: list[tuple[float, float, dict[int, tuple[int, int, bool]]]] = []
@@ -511,6 +514,7 @@ class GroupBuilder:
         """ev から新しいまとまりを始める。和音として押さえられなければ False。"""
         self.events, self.spans, self.beam = [], {}, [(0.0, 0.0, {})]
         self.hard, self.soft = set(), {}
+        self.melody = set()
         return self.add(ev)
 
     def overlap_beats(self, p: int, q: int) -> float:
@@ -540,6 +544,10 @@ class GroupBuilder:
         shape += RING_CUT * sum(lost for pair, lost in self.soft.items()
                                 if all(p in places for p in pair)
                                 and len({places[p][0] for p in pair}) == 1)
+        # アルペジオ＋メロディ: メロディは高音弦側(1〜3弦)で弾く。低い弦に置くほど減点
+        shape += MELODY_STRING_COST * sum(
+            max(0, len(self.opens) - 3 - places[p][0])
+            for p in self.melody if p in places and not places[p][2])
         # 右手で叩くのは高音弦が普通。低音弦ほど不自然なので避ける
         return shape + TAP_COST * len(taps) + 0.05 * sum(taps) + 0.4 * low_strings, shape
 
@@ -547,6 +555,11 @@ class GroupBuilder:
         """ev をまとまりに加える。無理のない運指が残らなければ何も変えず False。"""
         old_spans = {p: list(v) for p, v in self.spans.items()}
         old_pairs = (set(self.hard), dict(self.soft))
+        old_melody = set(self.melody)
+        mixed = self.styles.get(ev.step) == "mixed"
+        top = max(ev.ends)
+        if mixed and (len(ev.ends) > 1 or ev.ends[top] - ev.on_tick < 1.5 * self.tpb):
+            self.melody.add(top)  # 和音の一番上の音と、長く伸ばさない単音がメロディ
         for p, end in ev.ends.items():
             self.spans.setdefault(p, []).append((ev.on_tick, end))
         for p in ev.ends:
@@ -578,8 +591,10 @@ class GroupBuilder:
                     if string in busy or not 0 <= fret <= self.max_fret:
                         continue
                     grown.append({**places, p: (string, fret, False)})
-                    # 右手で叩くのは単音だけ(同時に弾く和音の片方だけを叩く形にはしない)
-                    if (self.tapping and len(self.events) > 1 and fret > 0 and len(ev.ends) == 1
+                    # 右手で叩くのは単音だけ。ただしアルペジオ＋メロディの区間では、
+                    # 左手で和音を押さえながら一番上のメロディ音を叩く形も許す
+                    if (self.tapping and len(self.events) > 1 and fret > 0
+                            and (len(ev.ends) == 1 or (mixed and p == top))
                             and string >= len(self.opens) - TAP_STRINGS
                             and (self.tap_steps is None or ev.step in self.tap_steps)):
                         grown.append({**places, p: (string, fret, True)})
@@ -596,6 +611,7 @@ class GroupBuilder:
         self.events.pop()
         self.spans = old_spans
         self.hard, self.soft = old_pairs
+        self.melody = old_melody
         return False
 
     def candidates(self) -> list[Cand]:
@@ -613,7 +629,8 @@ class GroupBuilder:
 
 
 def build_units(events: list[Event], opens: list[int], max_fret: int, max_span: int,
-                tpb: int, tapping: bool, tap_steps: set[int] | None = None
+                tpb: int, tapping: bool, tap_steps: set[int] | None = None,
+                styles: dict[int, str] | None = None
                 ) -> tuple[list[list[Event]], list[list[Cand]], int]:
     """イベントを「運指を一緒に決めるまとまり」に分け、それぞれの候補を作る。
 
@@ -623,7 +640,7 @@ def build_units(events: list[Event], opens: list[int], max_fret: int, max_span: 
     units: list[list[Event]] = []
     cand_lists: list[list[Cand]] = []
     dropped = 0
-    builder = GroupBuilder(opens, max_fret, max_span, tpb, tapping, tap_steps)
+    builder = GroupBuilder(opens, max_fret, max_span, tpb, tapping, tap_steps, styles)
     active = False
 
     def flush():
@@ -649,17 +666,19 @@ def build_units(events: list[Event], opens: list[int], max_fret: int, max_span: 
 
 def assign_fingerings(events: dict[int, Event], opens: list[int], grid: int,
                       max_fret: int, max_span: int, tpb: int = 480,
-                      tapping: bool = False, tap_steps: set[int] | None = None) -> Assignment:
+                      tapping: bool = False, tap_steps: set[int] | None = None,
+                      styles: dict[int, str] | None = None) -> Assignment:
     """曲全体で左手の移動が最小になるよう、各和音の運指を選ぶ(ビタビ)。
 
     tapping=True のとき、「左手を動かさず右手でタッピングする」選択肢も候補に入れる:
     レガートでつながる単音と、鳴らしっぱなしのコードの上に乗る高い音が対象。
     tap_steps を渡すと、そのステップの音だけをタッピングの対象にする。
+    styles は各ステップの奏法(textures.py)で、奏法ごとに弾きやすい形の基準を切り替える。
     """
     if not events:
         return Assignment({}, set(), 0)
     units, cand_lists, dropped_total = build_units(list(events.values()), opens, max_fret,
-                                                   max_span, tpb, tapping, tap_steps)
+                                                   max_span, tpb, tapping, tap_steps, styles)
     if not units:
         return Assignment({}, set(), dropped_total)
 
@@ -987,14 +1006,19 @@ def measure_difficulty(events: dict[int, Event], fingerings: dict[int, Fingering
 
 
 def choose_tap_steps(events: dict[int, Event], measures: list[Measure], opens: list[int],
-                     grid: int, max_fret: int, max_span: int, tpb: int,
-                     bpm: float | None) -> tuple[Assignment, set[int]]:
-    """タッピングを使うと難易度が下がる小節を探し、そこだけタッピングを許して運指を決める。
+                     grid: int, max_fret: int, max_span: int, tpb: int, bpm: float | None,
+                     styles: dict[int, str] | None = None) -> tuple[Assignment, set[int]]:
+    """タッピングを使う場所を選んで運指を決める。
 
-    戻り値: (運指, タッピングを採用した小節index)
+    タッピングを候補にするのは次の2つ:
+      - 「アルペジオ＋メロディ」の区間(両手奏法が自然な奏法)
+      - タッピングなし/ありを比べて、難易度の段階が下がる小節
+    戻り値: (運指, 難易度が下がるので採用した小節index)
     """
-    plain = assign_fingerings(events, opens, grid, max_fret, max_span, tpb)
-    tap = assign_fingerings(events, opens, grid, max_fret, max_span, tpb, tapping=True)
+    styles = styles or {}
+    common = (opens, grid, max_fret, max_span, tpb)
+    plain = assign_fingerings(events, *common, styles=styles)
+    tap = assign_fingerings(events, *common, tapping=True, styles=styles)
     args = (set(), measures, grid, tpb, bpm, opens)
     d_plain = measure_difficulty(events, plain.fingerings, plain.tapped, *args)
     d_tap = measure_difficulty(events, tap.fingerings, tap.tapped, *args)
@@ -1002,12 +1026,12 @@ def choose_tap_steps(events: dict[int, Event], measures: list[Measure], opens: l
                    for s in tap.tapped}
     easier = {mi for mi in tapped_bars
               if difficulty_level(d_tap.get(mi, 0)) < difficulty_level(d_plain.get(mi, 0))}
-    if not easier:
+    allowed = {s for s in events if styles.get(s) == "mixed"
+               or any(measures[mi][0] <= s < measures[mi][0] + measures[mi][1] for mi in easier)}
+    if not allowed:
         return plain, set()
-    allowed = {s for s in events
-               if any(measures[mi][0] <= s < measures[mi][0] + measures[mi][1] for mi in easier)}
-    return assign_fingerings(events, opens, grid, max_fret, max_span, tpb,
-                             tapping=True, tap_steps=allowed), easier
+    return assign_fingerings(events, *common, tapping=True, tap_steps=allowed,
+                             styles=styles), easier
 
 
 # ---------------------------------------------------------------- 打ち込み特有の処理
@@ -1208,14 +1232,20 @@ def analyze(mid: mido.MidiFile, *, tuning: str = "standard", capo: int = 0,
     step_ticks = tpb * 4 / grid
     last = max(max(events), round(max(e.end_tick for e in events.values()) / step_ticks) - 1)
     measures = build_measures(song, grid, last)
-    if tapping == "auto":  # 難易度が下がる小節だけタッピングにする
+    # 奏法を先に判定して、運指の決め方の切り替えに使う
+    styles = texturelib.smooth(
+        texturelib.classify(events, sorted(events), set(),
+                            find_ringing(events, sorted(events), grid, tpb), set(),
+                            60 / (song.bpm or 120) * 4 / grid, grid / 4), measures)
+    if tapping == "auto":  # 両手奏法が自然な区間と、難易度が下がる小節だけタッピングにする
         asg, eased = choose_tap_steps(events, measures, opens, grid, max_fret, max_span,
-                                      tpb, song.bpm)
+                                      tpb, song.bpm, styles)
         if eased:
             bars = ", ".join(str(mi + 1) for mi in sorted(eased))
             warnings.append(f"タッピングのほうが易しい {len(eased)} 小節にタッピングを採用しました: {bars}")
     else:
-        asg = assign_fingerings(events, opens, grid, max_fret, max_span, tpb, bool(tapping))
+        asg = assign_fingerings(events, opens, grid, max_fret, max_span, tpb, bool(tapping),
+                                styles=styles)
     if asg.dropped:
         warnings.append(f"同時に押さえられない {asg.dropped} 音を省略しました")
     if not asg.fingerings:
@@ -1228,6 +1258,8 @@ def analyze(mid: mido.MidiFile, *, tuning: str = "standard", capo: int = 0,
             raise ValueError("すべての音が非表示になっています")
     first, rhythm = build_rhythm(events, asg.fingerings, measures, grid, tpb)
     techs = detect_techniques(events, asg, tpb) if (legato or tapping) else {}
+    if not legato and tapping is not True:  # 既定(易しくなる所だけタッピング)では H/P は推定しない
+        techs = {step: tech for step, tech in techs.items() if tech[0] == "T"}
     ringing = find_ringing(events, list(asg.fingerings), grid, tpb)
     sounding = {s: e for s, e in events.items() if s not in dead_steps}
     names = chordlib.detect_chords(sounding, measures[first:], grid, tpb) if chords else {}
@@ -1248,8 +1280,9 @@ def analyze(mid: mido.MidiFile, *, tuning: str = "standard", capo: int = 0,
                                     grid, tpb, song.bpm, opens),
                  song.tempos,
                  texturelib.smooth(
+                     # 表示用。運指に使った判定と食い違わないよう、タッピングでは分類を変えない
                      texturelib.classify(events, list(asg.fingerings), dead_steps, ringing,
-                                         asg.tapped, 60 / (song.bpm or 120) * 4 / grid, grid / 4),
+                                         set(), 60 / (song.bpm or 120) * 4 / grid, grid / 4),
                      measures),
                  textures)
 
@@ -1265,7 +1298,7 @@ def analyze(mid: mido.MidiFile, *, tuning: str = "standard", capo: int = 0,
 #    "chords": {"<tick>": "Am7" | ""}}                 "" は自動判定の取り消し
 
 EDITABLE_OPTIONS = {"tuning": "standard", "capo": 0, "grid": None,
-                    "legato": False, "tapping": False, "chords": True, "expression": True,
+                    "legato": False, "tapping": "auto", "chords": True, "expression": True,
                     "dead_notes": None, "textures": True}
 
 

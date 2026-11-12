@@ -693,3 +693,28 @@ def test_textures_are_smoothed_per_measure():
     assert [out[s] for s in (16, 18, 20, 22)] == ["melody"] * 4
     assert [out[s] for s in (24, 26, 28)] == ["octave"] * 3
     assert textures.passage_starts(out) == {0: "mixed", 16: "melody", 24: "octave"}
+
+
+def test_arpeggio_plus_melody_style_uses_high_strings_and_taps():
+    # 低いコードを伸ばしたまま、単音・複音・短い音が混ざって動く(1小節に多数派の奏法が無い)
+    bass = [(0, 1900, 40), (0, 1900, 47)]
+    upper = [(240, 200, 64), (480, 400, 59), (480, 400, 64), (720, 700, 60), (720, 700, 67),
+             (960, 200, 79), (1200, 400, 62), (1200, 400, 66), (1440, 200, 76), (1680, 200, 71)]
+    mid = raw_midi(bass + upper)
+    score = m.analyze(mid, grid=8, tapping="auto")
+    import textures
+    assert set(score.textures.values()) == {"mixed"}
+    # 左手はローポジションのまま。届かない高い音は右手で叩く
+    assert score.fingerings[0] == ((0, 0), (1, 2))
+    assert score.tapped, score.fingerings
+    for step in score.tapped:
+        tap = max(score.fingerings[step], key=lambda n: n[1])
+        assert tap[0] >= 2 and tap[1] >= 10                 # 1〜4弦のハイフレット
+        assert score.techs[step][0] == "T"
+    # メロディ(各位置の一番上の音)は高音弦側に置く
+    tops = [max(f, key=lambda n: score.opens[n[0]] + n[1]) for s, f in score.fingerings.items() if s]
+    assert all(string >= 3 for string, _ in tops), tops
+    # 既定の設定では H/P は推定しない
+    assert {t[0] for t in score.techs.values()} == {"T"}
+    # --no-tapping 相当なら叩かない
+    assert m.analyze(mid, grid=8, tapping=False).tapped == set()
