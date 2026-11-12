@@ -24,6 +24,7 @@ import mido
 
 import chords as chordlib
 import marks as marklib
+import textures as texturelib
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
@@ -1141,6 +1142,8 @@ class Score:
     sections: dict[int, str] = field(default_factory=dict)     # 小節index → セクション名
     difficulty: dict[int, float] = field(default_factory=dict) # 小節index → 弾きにくさの点数
     tempos: list[tuple[int, int]] = field(default_factory=list)  # 再生用: (tick, 1拍のマイクロ秒)
+    textures: dict[int, str] = field(default_factory=dict)       # ステップ → 奏法 (textures.py)
+    show_textures: bool = True
 
     def tick(self, step: int) -> int:
         """ステップ番号 → tick。編集内容のキーに使う(グリッドを変えても同じ位置を指す)。"""
@@ -1153,7 +1156,7 @@ def analyze(mid: mido.MidiFile, *, tuning: str = "standard", capo: int = 0,
             max_fret: int = 20, max_span: int = 4,
             legato: bool = False, tapping: bool | str = False,
             chords: bool = True, expression: bool = True,
-            dead_notes: list[int] | None = None,
+            dead_notes: list[int] | None = None, textures: bool = True,
             edits: dict | None = None) -> Score:
     warnings: list[str] = []
     opens = [p + capo for p in parse_tuning(tuning)]
@@ -1243,7 +1246,12 @@ def analyze(mid: mido.MidiFile, *, tuning: str = "standard", capo: int = 0,
                  find_sections(song, measures, step_ticks),
                  measure_difficulty(events, asg.fingerings, asg.tapped, dead_steps, measures,
                                     grid, tpb, song.bpm, opens),
-                 song.tempos)
+                 song.tempos,
+                 texturelib.smooth(
+                     texturelib.classify(events, list(asg.fingerings), dead_steps, ringing,
+                                         asg.tapped, 60 / (song.bpm or 120) * 4 / grid, grid / 4),
+                     measures),
+                 textures)
 
 
 # ---------------------------------------------------------------- 手動編集
@@ -1258,7 +1266,7 @@ def analyze(mid: mido.MidiFile, *, tuning: str = "standard", capo: int = 0,
 
 EDITABLE_OPTIONS = {"tuning": "standard", "capo": 0, "grid": None,
                     "legato": False, "tapping": False, "chords": True, "expression": True,
-                    "dead_notes": None}
+                    "dead_notes": None, "textures": True}
 
 
 def apply_note_edits(asg: Assignment, opens: list[int], max_fret: int,
@@ -1456,6 +1464,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="タッピングを積極的に使う (--legato を含む)")
     ap.add_argument("--tapping-auto", action="store_true",
                     help="タッピングにしたほうが難易度の段階が下がる小節だけ、タッピングを使う")
+    ap.add_argument("--textures", action=argparse.BooleanOptionalAction,
+                    help="推定した奏法の種類(オクターブ、スウィープなど)を譜面に表示 (既定で有効)")
     ap.add_argument("--dead-notes", type=dead_note_list,
                     help="空ピッキング(ブラッシング)を表すノート番号(カンマ区切り)。X として表示する。"
                          "既定はギターの音域より高い音すべて。none で無視")

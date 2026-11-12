@@ -637,3 +637,59 @@ def test_low_string_on_higher_fret_is_avoided():
     shape = score.fingerings[4]
     assert m.inversion(shape) <= 2, shape
     assert (0, 7) not in shape
+
+
+def texture_names(score):
+    import textures
+    return [textures.LABELS[v] for _, v in sorted(textures.passage_starts(score.textures).items())]
+
+
+def test_textures_octave_power_and_strum():
+    octaves = []
+    for i, low in enumerate([64, 67, 65, 64]):
+        octaves += [(i * 480, 400, low), (i * 480, 400, low + 12)]
+    assert texture_names(m.analyze(raw_midi(octaves), grid=4)) == ["オクターブ"]
+    power = [(i * 480, 400, p) for i, root in enumerate([40, 43, 45]) for p in (root, root + 7, root + 12)]
+    assert texture_names(m.analyze(raw_midi(power), grid=4)) == ["パワーコード"]
+    # コードと空ピッキングが交互に並ぶ → コードストローク
+    strum = []
+    for i in range(4):
+        strum += [(i * 480, 200, p) for p in (45, 52, 57, 60)] + [(i * 480 + 240, 60, 94)]
+    assert texture_names(m.analyze(raw_midi(strum), grid=8)) == ["コードストローク"]
+    # ぽつんと鳴る和音はただのコード
+    lone = [(0, 900, p) for p in (48, 52, 55)] + [(1920, 480, 60)]
+    assert texture_names(m.analyze(raw_midi(lone), grid=4))[0] == "コード"
+
+
+def test_textures_arpeggio_sweep_run_and_melody():
+    ring = [(i * 240, 1900 - i * 240, p) for i, p in enumerate([45, 52, 57, 60, 64])]
+    assert texture_names(m.analyze(raw_midi(ring), grid=8)) == ["アルペジオ"]
+    # Am のコードトーンを16分で駆け上がって降りる(音は伸ばさない) → スウィープ
+    tones = [57, 60, 64, 69, 72, 76, 72, 69, 64, 60, 57]
+    sweep = [(i * 120, 100, p) for i, p in enumerate(tones)]
+    assert texture_names(m.analyze(raw_midi(sweep), grid=16)) == ["スウィープ"]
+    # 音階を速く上がる → 速弾き
+    scale = [(i * 120, 110, p) for i, p in enumerate([60, 62, 64, 65, 67, 69, 71, 72])]
+    assert texture_names(m.analyze(raw_midi(scale), grid=16)) == ["速弾き"]
+    # ゆっくりした単音 → 単音メロディ
+    slow = [(i * 480, 400, p) for i, p in enumerate([60, 64, 62, 67])]
+    assert texture_names(m.analyze(raw_midi(slow), grid=4)) == ["単音メロディ"]
+    # 表示を切れる
+    import tabsvg
+    shown = m.analyze(raw_midi(slow), grid=4)
+    hidden = m.analyze(raw_midi(slow), grid=4, textures=False)
+    assert "単音メロディ" in tabsvg.render_systems(shown)[0]
+    assert "単音メロディ" not in tabsvg.render_systems(hidden)[0]
+
+
+def test_textures_are_smoothed_per_measure():
+    import textures
+    measures = [(0, 16, 4, 4), (16, 16, 4, 4)]
+    raw = {0: "arpeggio", 2: "melody", 4: "double", 6: "arpeggio", 8: "melody", 10: "chord",   # 混在
+           16: "melody", 18: "melody", 20: "melody", 22: "double",                             # ほぼ単音
+           24: "octave", 26: "octave", 28: "octave"}                                           # はっきりした奏法
+    out = textures.smooth(raw, measures)
+    assert {out[s] for s in range(0, 12, 2)} == {"mixed"}
+    assert [out[s] for s in (16, 18, 20, 22)] == ["melody"] * 4
+    assert [out[s] for s in (24, 26, 28)] == ["octave"] * 3
+    assert textures.passage_starts(out) == {0: "mixed", 16: "melody", 24: "octave"}

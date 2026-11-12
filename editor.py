@@ -243,6 +243,7 @@ PAGE = """<!doctype html>
     </select></label>
   <label><input id="chords" type="checkbox"> コード名を推定</label>
   <label><input id="expression" type="checkbox"> チョーキング/ビブラートを推定</label>
+  <label><input id="textures" type="checkbox"> 奏法の種類を表示</label>
   <span class="spacer"></span>
   <button id="play" class="primary">▶ 再生</button>
   <label>速さ
@@ -289,6 +290,7 @@ function show(state) {
   $('tapping').value = o.tapping === 'auto' ? 'auto' : o.tapping ? 'on' : '';
   $('chords').checked = o.chords;
   $('expression').checked = o.expression;
+  $('textures').checked = o.textures;
   $('undo').disabled = history.length === 0;
 }
 
@@ -326,6 +328,7 @@ $('legato').onchange = e => commit(x => {
 $('tapping').onchange = e => setOption('tapping', e.target.value === 'auto' ? 'auto' : e.target.value === 'on');
 $('chords').onchange = e => setOption('chords', e.target.checked);
 $('expression').onchange = e => setOption('expression', e.target.checked);
+$('textures').onchange = e => setOption('textures', e.target.checked);
 $('title').onchange = e => commit(x => { x.title = e.target.value.trim(); });
 $('undo').onclick = async () => {
   if (!history.length) return;

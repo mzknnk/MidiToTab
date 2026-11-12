@@ -8,13 +8,14 @@ from __future__ import annotations
 from html import escape
 
 import marks as marklib
+import textures as texturelib
 from midi2tab import Item, Score, difficulty_level, pitch_class_name
 
 PAGE_W = 1100
 LEFT = 40          # 弦名ラベルの分
 RIGHT = 10
 TOP = 132          # 譜表より上(小節番号・let ring・奏法記号)
-BOTTOM = 52        # 譜表より下(リズム)
+BOTTOM = 68        # 譜表より下(リズム)
 GAP = 13           # 弦の間隔
 PAD_L = 14         # 小節線から最初の音まで
 TS_W = 28          # 拍子記号の幅
@@ -133,6 +134,7 @@ def draw_system(score: Score, measure_ids: list[int], last: bool) -> str:
     event_cx: dict[int, float] = {}     # この段での各イベントの先頭x
     prev_cx: dict[int, float] = {}      # タイ用: イベントの直前の要素x
     half_w: dict[int, float] = {}       # 各イベントの数字の半幅
+    texture_starts = texturelib.passage_starts(score.textures) if score.show_textures else {}
     # 「let ring ----|」のように範囲で示す記号: 名前 → [開始x, 終了x]
     spans: dict[str, list] = {"let ring": [None, 0.0], "P.M.": [None, 0.0]}
     span_y = {"let ring": top - 56, "P.M.": top - 69}
@@ -230,6 +232,10 @@ def draw_system(score: Score, measure_ids: list[int], last: bool) -> str:
                               f'{cx - (9 if lead else 2):.1f} {y}" fill="none" stroke="{GREY}" stroke-width="1.3"/>')
             else:
                 event_cx[it.step] = cx
+                if it.step in texture_starts:  # 奏法が切り替わる位置に、その名前を出す
+                    name = texturelib.LABELS[texture_starts[it.step]]
+                    fg.append(f'<text x="{cx - 5:.1f}" y="{ye + 27}" font-size="9.5" '
+                              f'fill="#3b6ea5">{escape(name)}</text>')
                 marks = score.marks.get(it.step, ())
                 hw = 0.0
                 for s, fret in fing:
