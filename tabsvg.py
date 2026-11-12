@@ -13,7 +13,7 @@ from midi2tab import Item, Score, pitch_class_name
 PAGE_W = 1100
 LEFT = 40          # 弦名ラベルの分
 RIGHT = 10
-TOP = 112          # 譜表より上(小節番号・let ring・奏法記号)
+TOP = 132          # 譜表より上(小節番号・let ring・奏法記号)
 BOTTOM = 52        # 譜表より下(リズム)
 GAP = 13           # 弦の間隔
 PAD_L = 14         # 小節線から最初の音まで
@@ -166,6 +166,13 @@ def draw_system(score: Score, measure_ids: list[int], last: bool) -> str:
         items = score.rhythm[mi]
         fg.append(f'<text x="{x + 3:.1f}" y="{top - 7}" font-size="9.5" fill="{GREY}">'
                   f'{score.first_measure + mi + 1}</text>')
+        section = score.sections.get(score.first_measure + mi)
+        if section:  # セクション名 (MIDIのマーカー)
+            w = 7.4 * len(section) + 12
+            fg.append(f'<rect x="{x + 1:.1f}" y="{top - 118}" width="{w:.1f}" height="17" rx="2" '
+                      f'fill="#fff" stroke="{INK}"/>')
+            fg.append(f'<text x="{x + 7:.1f}" y="{top - 105.5}" font-size="12" font-weight="700" '
+                      f'fill="{INK}">{escape(section)}</text>')
         if shows_time_sig(score, mi):
             cy = top + staff_h / 2
             for text, dy in ((num, -3), (den, 19)):

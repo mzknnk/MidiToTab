@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import argparse
+import bisect
+import collections
 import itertools
 import json
 import os
@@ -40,6 +42,7 @@ TUNINGS = {
 AUTO_GRIDS = [4, 8, 12, 16, 24, 32, 48]
 MAX_CANDIDATES = 40  # 和音ごとに保持する運指候補の上限
 HAND_REACH = 3       # 手を動かさずに届く範囲: ポジション p なら p〜p+3 フレット
+MAX_GROUP_COST = 3.5  # アルペジオを1つのフォームとみなす上限(これより弾きにくければ分ける)
 TAP_COST = 2.5       # 右手タッピング1音のコスト(ポジション移動との比較用)
 
 
@@ -93,6 +96,8 @@ class Song:
     bpm: float | None
     wheel: dict[int, list[tuple[int, float]]] = field(default_factory=dict)  # ch → (tick, 半音)
     mod: dict[int, list[tuple[int, int]]] = field(default_factory=dict)      # ch → (tick, CC1)
+    dead: list[int] = field(default_factory=list)                 # 空ピッキングのtick
+    markers: list[tuple[int, str]] = field(default_factory=list)  # (tick, セクション名)
 
 
 @dataclass
@@ -103,16 +108,26 @@ class TrackInfo:
     channels: set[int] = field(default_factory=set)
     low: int | None = None
     high: int | None = None
+    instrument: str = ""
+    first_tick: int | None = None
+    last_tick: int = 0
 
 
 def scan_tracks(mid: mido.MidiFile) -> list[TrackInfo]:
     infos = []
     for i, track in enumerate(mid.tracks):
         info = TrackInfo(i, "", 0)
+        tick = 0
         for msg in track:
+            tick += msg.time
             if msg.type == "track_name" and not info.name:
                 info.name = msg.name.strip()
+            elif msg.type == "instrument_name" and not info.instrument:
+                info.instrument = msg.name.strip()
             elif msg.type == "note_on" and msg.velocity > 0:
+                if info.first_tick is None:
+                    info.first_tick = tick
+                info.last_tick = tick
                 info.notes += 1
                 info.channels.add(msg.channel)
                 info.low = msg.note if info.low is None else min(info.low, msg.note)
@@ -122,7 +137,8 @@ def scan_tracks(mid: mido.MidiFile) -> list[TrackInfo]:
 
 
 def load_song(mid: mido.MidiFile, tracks: list[int] | None = None,
-              channels: list[int] | None = None, transpose: int = 0) -> Song:
+              channels: list[int] | None = None, transpose: int = 0,
+              dead_notes: frozenset[int] = frozenset()) -> Song:
     """ノート(発音tick, 消音tick, 音高)を集める。ドラム(ch10)は既定で除外。"""
     notes: list[Note] = []
     time_sigs = []
@@ -131,6 +147,8 @@ def load_song(mid: mido.MidiFile, tracks: list[int] | None = None,
     mod: dict[int, list[tuple[int, int]]] = {}
     bend_range: dict[int, float] = {}  # ch → ピッチベンドの幅(半音)。既定は±2
     rpn: dict[int, list[int]] = {}
+    dead: list[int] = []
+    markers: list[tuple[int, str]] = []
     for i, track in enumerate(mid.tracks):
         tick = 0
         sounding: dict[tuple[int, int], list[Note]] = {}
@@ -150,6 +168,8 @@ def load_song(mid: mido.MidiFile, tracks: list[int] | None = None,
                     rpn.setdefault(msg.channel, [127, 127])[msg.control - 100] = msg.value
                 elif msg.control == 6 and rpn.get(msg.channel) == [0, 0]:
                     bend_range[msg.channel] = float(msg.value)
+            elif msg.type == "marker":
+                markers.append((tick, msg.text.strip()))
             elif msg.type in ("note_on", "note_off"):
                 if tracks is not None and i not in tracks:
                     continue
@@ -157,6 +177,10 @@ def load_song(mid: mido.MidiFile, tracks: list[int] | None = None,
                     if msg.channel not in channels:
                         continue
                 elif msg.channel == 9:
+                    continue
+                if msg.note in dead_notes:  # 空ピッキング用のキー
+                    if msg.type == "note_on" and msg.velocity > 0:
+                        dead.append(tick)
                     continue
                 key = (msg.channel, msg.note)
                 if msg.type == "note_on" and msg.velocity > 0:
@@ -174,7 +198,12 @@ def load_song(mid: mido.MidiFile, tracks: list[int] | None = None,
         time_sigs.insert(0, (0, 4, 4))
     for curve in list(wheel.values()) + list(mod.values()):
         curve.sort(key=lambda p: p[0])
-    return Song(mid.ticks_per_beat, notes, time_sigs, bpm, wheel, mod)
+    dead = sorted(set(dead))
+    for n in notes:  # 空ピッキングは弦を止めるので、鳴っている音はそこで切る
+        j = bisect.bisect_right(dead, n.on)
+        if j < len(dead) and dead[j] < n.off:
+            n.off = dead[j]
+    return Song(mid.ticks_per_beat, notes, time_sigs, bpm, wheel, mod, dead, sorted(markers))
 
 
 # ---------------------------------------------------------------- クオンタイズ
@@ -301,6 +330,8 @@ def shape_cost(fing: Fingering) -> float:
         return 0.0
     lo, hi = min(fretted), max(fretted)
     cost = 0.5 * (hi - lo) + 0.1 * hi  # 幅が狭く、ローポジションほど良い
+    # ハイポジションで開放弦を混ぜる形は、音は出せても普通は選ばない
+    cost += 0.4 * (len(fing) - len(fretted)) * max(0, lo - 4)
     fingers = len(fretted) - max(0, fretted.count(lo) - 1)  # 最低フレットはバレー可
     if fingers > 4:
         cost += 10.0
@@ -355,8 +386,10 @@ def group_ringing(events: list[Event], opens: list[int], max_fret: int,
     groups = [[events[0]]]
     for prev, ev in zip(events, events[1:]):
         union = sorted({p for e in groups[-1] for p in e.ends} | set(ev.ends))
-        if (prev.min_end_tick > ev.on_tick + tpb / 4 and len(union) <= len(opens)
-                and enumerate_fingerings(union, opens, max_fret, max_span)):
+        shapes = (enumerate_fingerings(union, opens, max_fret, max_span)
+                  if prev.min_end_tick > ev.on_tick + tpb / 4 and len(union) <= len(opens) else [])
+        # 無理のないフォームで押さえられるときだけ、まとめて1つのコードとして扱う
+        if shapes and min(map(shape_cost, shapes)) <= MAX_GROUP_COST:
             groups[-1].append(ev)
         else:
             groups.append([ev])
@@ -588,6 +621,114 @@ def find_ringing(events: dict[int, Event], steps: list[int], grid: int, tpb: int
             if events[a].end_tick > b * step_ticks + tpb / 4}
 
 
+# ---------------------------------------------------------------- 打ち込み特有の処理
+
+def collapse_glissandi(song: Song) -> dict[int, str]:
+    """半音ずつ素早く上下する音の連なり(打ち込みのスライド効果)を1つの記号にまとめる。
+
+    声部ごとに「前の音が終わると同時に半音隣のごく短い音が始まる」連なりを探す。
+    該当する音は song.notes から取り除き、元の音を連なりの終わりまで伸ばす。
+    戻り値: 元の音のtick → "so_down" / "so_up"
+    """
+    tpb = song.ticks_per_beat
+    short, join = tpb / 10, tpb / 16
+    notes = sorted(song.notes, key=lambda n: n.on)
+    by_pitch: dict[int, list[Note]] = collections.defaultdict(list)
+    for n in notes:
+        by_pitch[n.pitch].append(n)
+    removed: set[int] = set()
+    out: dict[int, str] = {}
+
+    def follower(a: Note, d: int) -> Note | None:
+        for b in by_pitch.get(a.pitch + d, ()):
+            if (id(b) not in removed and b.on > a.on and abs(b.on - a.off) <= join
+                    and b.off - b.on <= short):
+                return b
+        return None
+
+    for a in notes:
+        if id(a) in removed:
+            continue
+        for d in (-1, 1):
+            chain = []
+            cur = a
+            while (b := follower(cur, d)) is not None:
+                chain.append(b)
+                cur = b
+            if len(chain) >= 4:
+                removed.update(id(n) for n in chain)
+                a.off = max(a.off, chain[-1].off)
+                out[a.on] = "so_down" if d < 0 else "so_up"
+                break
+    song.notes = [n for n in song.notes if id(n) not in removed]
+    return out
+
+
+def collapse_grace_notes(song: Song) -> dict[int, str]:
+    """直後の音へ半音〜全音で滑り込むごく短い音を、スライドインの記号にまとめる。
+
+    戻り値: 滑り込んだ先の音のtick → "si_up"(下から) / "si_down"(上から)
+    """
+    tpb = song.ticks_per_beat
+    by_pitch: dict[int, list[Note]] = collections.defaultdict(list)
+    for n in song.notes:
+        by_pitch[n.pitch].append(n)
+    removed: set[int] = set()
+    out: dict[int, str] = {}
+    for a in sorted(song.notes, key=lambda n: n.on):
+        length = a.off - a.on
+        if length > tpb / 8:
+            continue
+        for d in (1, -1, 2, -2):
+            target = next((b for b in by_pitch.get(a.pitch + d, ())
+                           if b.on > a.on and abs(b.on - a.off) <= tpb / 24
+                           and b.off - b.on >= 2 * length and id(b) not in removed), None)
+            if target is not None:
+                removed.add(id(a))
+                out[target.on] = "si_up" if d > 0 else "si_down"
+                break
+    song.notes = [n for n in song.notes if id(n) not in removed]
+    return out
+
+
+def add_dead_strums(song: Song, events: dict[int, Event], asg: Assignment,
+                    opens: list[int], step_ticks: float) -> set[int]:
+    """空ピッキングを、直前のコードと同じ弦の X として譜面に加える。"""
+    real = sorted(asg.fingerings)
+    added: set[int] = set()
+    for tick in song.dead:
+        step = round(tick / step_ticks)
+        if step in asg.fingerings or not real:
+            continue
+        i = bisect.bisect_left(real, step)
+        # 近くにコード(3音以上)があればその形、なければ直前の音の弦を使う
+        near = [s for s in real[max(0, i - 8):i] if len(asg.fingerings[s]) >= 3]
+        ref = near[-1] if near else real[i - 1] if i else real[0]
+        fing = asg.fingerings[ref]
+        asg.fingerings[step] = fing
+        events[step] = Event(step, tick, {opens[s] + f: tick + round(step_ticks) for s, f in fing},
+                             events[ref].channel)
+        added.add(step)
+    if added:
+        asg.fingerings = dict(sorted(asg.fingerings.items()))
+        ordered = dict(sorted(events.items()))
+        events.clear()
+        events.update(ordered)
+    return added
+
+
+def find_sections(song: Song, measures: list[Measure], step_ticks: float) -> dict[int, str]:
+    """MIDIのマーカー(Verse, Chorus など)を、いちばん近い小節の頭に割り当てる。"""
+    starts = [m[0] for m in measures]
+    out: dict[int, str] = {}
+    for tick, text in song.markers:
+        step = tick / step_ticks
+        i = min(range(len(starts)), key=lambda k: abs(starts[k] - step))
+        if text and abs(starts[i] - step) <= measures[i][1] / 2:
+            out[i] = text
+    return out
+
+
 # ---------------------------------------------------------------- 解析全体
 
 @dataclass
@@ -609,6 +750,7 @@ class Score:
     tpb: int = 480
     max_fret: int = 20
     marks: dict[int, list[str]] = field(default_factory=dict)  # ステップ → マーク
+    sections: dict[int, str] = field(default_factory=dict)     # 小節index → セクション名
 
     def tick(self, step: int) -> int:
         """ステップ番号 → tick。編集内容のキーに使う(グリッドを変えても同じ位置を指す)。"""
@@ -621,23 +763,44 @@ def analyze(mid: mido.MidiFile, *, tuning: str = "standard", capo: int = 0,
             max_fret: int = 20, max_span: int = 4,
             legato: bool = False, tapping: bool = False,
             chords: bool = True, expression: bool = True,
+            dead_notes: list[int] | None = None,
             edits: dict | None = None) -> Score:
     warnings: list[str] = []
     opens = [p + capo for p in parse_tuning(tuning)]
     max_fret -= capo
-    song = load_song(mid, tracks, channels, transpose)
+    song = load_song(mid, tracks, channels, transpose, frozenset(dead_notes or ()))
     if not song.notes:
         raise ValueError("ノートが見つかりません(トラック/チャンネル指定を確認してください)")
+    tpb = song.ticks_per_beat
+    glides = collapse_glissandi(song) if expression else {}
+    if expression:
+        glides.update(collapse_grace_notes(song))
+    # 一瞬だけ鳴る音は演奏ノイズとみなす
+    tiny = [n for n in song.notes if n.off - n.on < tpb / 32]
+    if tiny and len(tiny) < len(song.notes):
+        song.notes = [n for n in song.notes if n.off - n.on >= tpb / 32]
+        warnings.append(f"ごく短い {len(tiny)} 音を無視しました")
 
+    # 音域より高い音は弾けない(音源のキースイッチであることが多い)ので無視する。
+    # 低すぎる音はオクターブ上げて収める
+    top = max(opens) + max_fret
+    too_high = collections.Counter(n.pitch for n in song.notes if n.pitch > top)
+    song.notes = [n for n in song.notes if n.pitch <= top]
+    if too_high:
+        names = ", ".join(f"{pitch_class_name(p)}{p // 12 - 1}(ノート番号{p})×{c}"
+                          for p, c in sorted(too_high.items()))
+        warnings.append(f"音域より高い {sum(too_high.values())} 音を無視しました: {names}。"
+                        "空ピッキング用のキーなら --dead-notes で X として表示できます")
+    if not song.notes:
+        raise ValueError("このチューニングで弾ける音がありません")
     shifted = 0
     for n in song.notes:
         new = fit_range(n.pitch, opens, max_fret)
         shifted += new != n.pitch
         n.pitch = new
     if shifted:
-        warnings.append(f"音域外の {shifted} 音をオクターブ移動しました")
+        warnings.append(f"音域より低い {shifted} 音をオクターブ上げました")
 
-    tpb = song.ticks_per_beat
     if grid is None:
         grid = choose_grid(song)
     events = quantize(song, grid)
@@ -648,6 +811,7 @@ def analyze(mid: mido.MidiFile, *, tuning: str = "standard", capo: int = 0,
         raise ValueError("このチューニングで弾ける音がありません")
 
     step_ticks = tpb * 4 / grid
+    dead_steps = add_dead_strums(song, events, asg, opens, step_ticks)
     if edits:
         apply_note_edits(asg, opens, max_fret, edits, step_ticks)
         if not asg.fingerings:
@@ -657,15 +821,21 @@ def analyze(mid: mido.MidiFile, *, tuning: str = "standard", capo: int = 0,
     first, rhythm = build_rhythm(events, asg.fingerings, measures, grid, tpb)
     techs = detect_techniques(events, asg, tpb) if (legato or tapping) else {}
     ringing = find_ringing(events, list(asg.fingerings), grid, tpb)
-    names = chordlib.detect_chords(events, measures[first:], grid, tpb) if chords else {}
+    sounding = {s: e for s, e in events.items() if s not in dead_steps}
+    names = chordlib.detect_chords(sounding, measures[first:], grid, tpb) if chords else {}
     marks = marklib.detect_expression(song, events) if expression else {}
+    for tick, code in glides.items():
+        marks.setdefault(round(tick / step_ticks), []).append(code)
+    for s in dead_steps:
+        marks[s] = ["x"]
     if edits:
         apply_mark_edits(techs, names, asg.fingerings, edits, step_ticks)
         for key, codes in edits.get("marks", {}).items():
             marks[round(int(key) / step_ticks)] = marklib.clean_marks(codes)
     marks = {s: m for s, m in marks.items() if m and s in asg.fingerings}
     return Score(opens, capo, grid, song.bpm, events, measures, asg.fingerings,
-                 asg.tapped, techs, ringing, names, first, rhythm, warnings, tpb, max_fret, marks)
+                 asg.tapped, techs, ringing, names, first, rhythm, warnings, tpb, max_fret, marks,
+                 find_sections(song, measures, step_ticks))
 
 
 # ---------------------------------------------------------------- 手動編集
@@ -679,7 +849,8 @@ def analyze(mid: mido.MidiFile, *, tuning: str = "standard", capo: int = 0,
 #    "chords": {"<tick>": "Am7" | ""}}                 "" は自動判定の取り消し
 
 EDITABLE_OPTIONS = {"tuning": "standard", "capo": 0, "grid": None,
-                    "legato": False, "tapping": False, "chords": True, "expression": True}
+                    "legato": False, "tapping": False, "chords": True, "expression": True,
+                    "dead_notes": None}
 
 
 def apply_note_edits(asg: Assignment, opens: list[int], max_fret: int,
@@ -851,6 +1022,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="音が切れずにつながる同一弦の音を H(ハンマリング)/P(プリング) と推定する")
     ap.add_argument("--tapping", action=argparse.BooleanOptionalAction,
                     help="左手が届かないレガートの音を T(タッピング) と推定する (--legato を含む)")
+    ap.add_argument("--dead-notes", type=int_list,
+                    help="空ピッキング(ブラッシング)を表すノート番号(カンマ区切り)。X として表示する")
     ap.add_argument("--expression", action=argparse.BooleanOptionalAction,
                     help="ピッチベンドからチョーキング・ビブラートを推定 (既定で有効)")
     ap.add_argument("--chords", action=argparse.BooleanOptionalAction,
@@ -869,7 +1042,13 @@ def main(argv: list[str] | None = None) -> int:
             rng = (f"{pitch_class_name(t.low)}{t.low // 12 - 1}-"
                    f"{pitch_class_name(t.high)}{t.high // 12 - 1}") if t.notes else "-"
             chs = ",".join(str(c + 1) for c in sorted(t.channels)) or "-"
-            print(f"track {t.index}: {t.name or '(無名)':<24} notes={t.notes:<5} ch={chs:<6} 音域={rng}")
+            name = t.name or "(無名)"
+            if t.instrument and t.instrument != t.name:
+                name += f" / {t.instrument}"
+            span = (f"{t.first_tick / mid.ticks_per_beat:.0f}-{t.last_tick / mid.ticks_per_beat:.0f}拍"
+                    if t.notes else "-")
+            print(f"track {t.index:>2}: {name:<26} notes={t.notes:<5} ch={chs:<4} 音域={rng:<8} 位置={span}")
+        print("位置が重ならないトラックは曲の区間ごとの断片なので、--track を付けずに全部まとめて変換する")
         return 0
 
     out_name = (args.output or "").lower()

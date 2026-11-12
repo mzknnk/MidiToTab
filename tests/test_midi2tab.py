@@ -403,3 +403,74 @@ def test_editor_falls_back_when_default_port_is_taken():
             editor.open_server(session, editor.DEFAULT_PORT)
     finally:
         blocker.close()
+
+
+def raw_midi(notes, markers=()):
+    """notes: [(開始tick, 長さtick, 音高)]、markers: [(tick, 名前)]"""
+    mid = mido.MidiFile(ticks_per_beat=480)
+    track = mido.MidiTrack()
+    mid.tracks.append(track)
+    msgs = [(t, mido.MetaMessage("marker", text=text)) for t, text in markers]
+    for on, length, pitch in notes:
+        msgs.append((on, mido.Message("note_on", note=pitch, velocity=90)))
+        msgs.append((on + length, mido.Message("note_off", note=pitch)))
+    msgs.sort(key=lambda p: (p[0], p[1].type != "note_off"))
+    now = 0
+    for tick, msg in msgs:
+        track.append(msg.copy(time=tick - now))
+        now = tick
+    return mid
+
+
+def test_programmed_slide_down_becomes_one_mark():
+    # オクターブの和音のあと、半音ずつ素早く下がる効果音が続く(声部ごとに1〜3tickずれている)
+    notes = [(0, 190, 57), (0, 191, 69)]
+    t = 190
+    for i, gap in enumerate([37, 18, 17, 13, 7, 6]):
+        notes += [(t, gap, 56 - i), (t + (i % 3), gap, 68 - i)]
+        t += gap
+    notes.append((960, 480, 60))
+    score = m.analyze(raw_midi(notes), grid=16)
+    assert score.warnings == []
+    assert sorted(score.fingerings) == [0, 8]              # 効果音は譜面に出さない
+    assert len(score.fingerings[0]) == 2
+    assert score.marks == {0: ["so_down"]}
+    # 自動判定を切ると、そのままの音として扱う
+    assert len(m.analyze(raw_midi(notes), grid=16, expression=False).fingerings) > 2
+
+
+def test_grace_note_becomes_slide_in():
+    score = m.analyze(raw_midi([(0, 480, 60), (448, 32, 70), (480, 400, 69)]), grid=16)
+    assert sorted(score.fingerings) == [0, 4]
+    assert score.marks == {4: ["si_down"]}
+
+
+def test_keyswitch_notes_ignored_or_shown_as_dead_strums():
+    chord = [(0, 400, p) for p in (45, 53, 60, 64)]
+    notes = chord + [(240, 60, 94), (360, 60, 93), (480, 400, 62)]
+    plain = m.analyze(raw_midi(notes), grid=16)
+    assert sorted(plain.fingerings) == [0, 4]
+    assert "ノート番号93" in plain.warnings[0] and "--dead-notes" in plain.warnings[0]
+
+    score = m.analyze(raw_midi(notes), grid=16, dead_notes=[93, 94])
+    assert score.warnings == []
+    assert sorted(score.fingerings) == [0, 2, 3, 4]
+    assert score.fingerings[2] == score.fingerings[0] == score.fingerings[3]   # 同じ弦を X で
+    assert score.marks == {2: ["x"], 3: ["x"]}
+    assert score.chords == {0: "Fmaj7/A"}                  # X はコード判定に影響しない
+    assert 0 not in score.ringing                          # 空ピッキングで音は止まる
+
+
+def test_sections_from_markers_and_track_listing(tmp_path, capsys):
+    mid = raw_midi([(1920, 480, 60), (3840, 480, 62)], markers=[(1915, "Verse"), (3900, "Chorus")])
+    mid.tracks[0].insert(0, mido.MetaMessage("instrument_name", name="Lead_Gt2", time=0))
+    mid.tracks[0].insert(0, mido.MetaMessage("track_name", name="Lead_Gt1", time=0))
+    score = m.analyze(mid, grid=4)
+    assert score.sections == {1: "Verse", 2: "Chorus"}     # 少しずれたマーカーも小節頭に寄せる
+    import tabsvg
+    assert "Verse" in "".join(tabsvg.render_systems(score))
+    path = tmp_path / "s.mid"
+    mid.save(path)
+    assert m.main([str(path), "--list"]) == 0
+    out = capsys.readouterr().out
+    assert "Lead_Gt1 / Lead_Gt2" in out and "位置=4-8拍" in out
